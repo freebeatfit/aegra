@@ -8,18 +8,21 @@ import threading
 import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping, MutableMapping
 from functools import partial
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from langgraph.types import Interrupt
 from sse_starlette import EventSourceResponse
 
 from aegra_api.api import event_streaming as es_module
 from aegra_api.core.auth_deps import get_current_user, require_auth
+from aegra_api.core.database import db_manager
 from aegra_api.models.auth import User
 from aegra_api.models.event_streaming import EventStreamRequest
 from aegra_api.models.runs import RunCreate
@@ -84,6 +87,16 @@ def _v2_enabled(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     caps._probe_runtime_symbols.cache_clear()
     yield
     caps._probe_runtime_symbols.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _pending_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The thread's latest checkpoint has interrupt a*32 pending."""
+    saver = MagicMock()
+    saver.aget_tuple = AsyncMock(
+        return_value=SimpleNamespace(pending_writes=[("task-1", "__interrupt__", (Interrupt(value="?", id="a" * 32),))])
+    )
+    monkeypatch.setattr(db_manager, "_checkpointer", saver)
 
 
 class TestCommandRoute:
@@ -212,6 +225,49 @@ class TestCommandRoute:
         assert resp.json()["type"] == "error"
         assert resp.json()["error"] == "invalid_argument"
         prepare.assert_not_called()
+
+    def test_input_respond_to_non_pending_interrupt_is_no_such_interrupt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        prepare = AsyncMock()
+        monkeypatch.setattr(cmd_module, "_prepare_run", prepare)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 4,
+                "method": "input.respond",
+                "params": {"interrupt_id": "c" * 32, "namespace": [], "response": {"approved": True}},
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "error"
+        assert resp.json()["error"] == "no_such_interrupt"
+        prepare.assert_not_called()
+
+    def test_run_start_refused_by_busy_thread_is_unknown_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def busy(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            raise HTTPException(409, "Thread is already running a task.")
+
+        monkeypatch.setattr(cmd_module, "_prepare_run", busy)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 5,
+                "method": "run.start",
+                "params": {"assistant_id": "agent", "input": {"messages": []}, "multitaskStrategy": "reject"},
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "type": "error",
+            "id": 5,
+            "error": "unknown_error",
+            "message": "Thread is already running a task.",
+        }
 
     def test_unknown_command_returns_error_envelope_on_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Protocol errors ride HTTP 200 so envelope-parsing clients see the code."""

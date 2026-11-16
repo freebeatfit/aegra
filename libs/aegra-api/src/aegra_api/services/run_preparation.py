@@ -27,7 +27,7 @@ from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, Run
 from aegra_api.models.runs import Durability
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
-from aegra_api.services.run_status import set_thread_status
+from aegra_api.services.run_status import ACTIVE_RUN_STATES, set_thread_status
 from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
 from aegra_api.utils.jsonb import jsonb_patch, jsonb_shallow_merge
@@ -206,6 +206,22 @@ async def update_thread_metadata(
     )
 
 
+async def _reject_if_thread_busy(session: AsyncSession, thread_id: str) -> None:
+    """409 when the thread has an active run, as the official server answers ``multitask_strategy="reject"``.
+
+    The thread row stays locked until the caller commits its run, so concurrent creations on any replica
+    see each other's runs.
+    """
+    await session.execute(select(ThreadORM.thread_id).where(ThreadORM.thread_id == thread_id).with_for_update())
+    active_run_id = await session.scalar(
+        select(RunORM.run_id).where(RunORM.thread_id == thread_id, RunORM.status.in_(ACTIVE_RUN_STATES)).limit(1)
+    )
+    if active_run_id is not None:
+        raise HTTPException(
+            409, "Thread is already running a task. Wait for it to finish or choose a different multitask strategy."
+        )
+
+
 def _resolve_checkpoint(request: RunCreate) -> dict[str, Any] | None:
     """Fold the top-level ``checkpoint_id`` into ``checkpoint``; ``checkpoint`` keys win."""
     if request.checkpoint_id is None:
@@ -262,6 +278,9 @@ async def _prepare_run(
     ``(run_id, run_model, job)``.
     """
     await _validate_resume_command(session, thread_id, request.command)
+    # After the resume check: its settle poll must not hold the lock finalize_run needs.
+    if request.multitask_strategy == "reject":
+        await _reject_if_thread_busy(session, thread_id)
 
     run_id = str(uuid4())
     langgraph_service = get_langgraph_service()

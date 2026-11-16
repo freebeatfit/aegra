@@ -41,6 +41,7 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Sync wait | Supported | Block until run completes and return final output. |
 | Subgraph streaming | Supported | Stream events from nested subgraphs. |
 | Stateless runs | Supported | Execute without persisting thread state. |
+| Multitask strategy `reject` | Supported | A run with `multitask_strategy: "reject"` (v2 `multitaskStrategy`) is refused while the thread has a pending or running run: `409` on REST, `unknown_error` on v2 `run.start`. `interrupt`, `rollback` and `enqueue` are accepted but not applied yet; the new run starts alongside the active one. |
 | Checkpoint durability | Supported | `durability` (`sync`, `async`, `exit`) per run or cron, deprecated `checkpoint_during` alias, server default via `checkpointer.durability` or `AEGRA_CHECKPOINT_DURABILITY`. |
 | Cron / scheduled jobs | Supported | Create, read, update, delete, search, and count scheduled jobs, including metadata filtering. Standard and seconds-level cron expressions. IANA timezone support. |
 
@@ -65,6 +66,7 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Interrupt before / after | Supported | Pause execution at specific nodes. |
 | User approval gates | Supported | Resume or reject interrupted runs. |
 | State editing | Supported | Modify thread state before resuming. |
+| Answer pending interrupts only | Supported | `input.respond` to an interrupt that is not pending on the thread answers `no_such_interrupt`. While a run is in flight the check is skipped, as on the LangGraph server. |
 | Resume with `update` / `goto` | Supported | `input.respond` folds a state update or directed jump into the resume, one checkpoint. Also available as `command` on v1 run creation. |
 
 ### Storage

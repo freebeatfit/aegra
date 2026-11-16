@@ -10,6 +10,7 @@ identical; only the transport differs.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Sequence
 from typing import Any
 from uuid import UUID
 
@@ -19,6 +20,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.models import User
@@ -35,6 +37,9 @@ def _status_to_error_code(status_code: int) -> ErrorCode:
         return "no_such_run"
     if status_code == 403:
         return "permission_denied"
+    if status_code == 409:
+        # A busy thread refusing the run; the protocol has no conflict code, and the official server sends this.
+        return "unknown_error"
     return "invalid_argument"
 
 
@@ -181,7 +186,7 @@ async def _run_start(
     # would discard the pending tasks.
     input_data = params.get("input")
     command: dict[str, Any] | None = None
-    if input_data is not None and await _thread_is_interrupted(session, thread_id, user):
+    if input_data is not None and await _thread_status(session, thread_id, user) == "interrupted":
         command = {"resume": input_data}
         input_data = None
 
@@ -207,16 +212,17 @@ async def _run_start(
     return build_success(command_id, {"run_id": run_id}, applied_through_seq=0), run_id
 
 
-async def _thread_is_interrupted(session: AsyncSession, thread_id: str, user: User) -> bool:
-    status = await session.scalar(
+async def _thread_status(session: AsyncSession, thread_id: str, user: User) -> str | None:
+    return await session.scalar(
         select(ThreadORM.status).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
     )
-    return status == "interrupted"
 
 
 # langgraph interrupt ids are xxh3-128 hexdigests; a resume map is only
 # recognized as id-targeted when every key matches this shape.
 _INTERRUPT_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+# The pending-write channel LangGraph saves a task's raised interrupts under.
+_INTERRUPT_CHANNEL = "__interrupt__"
 
 
 async def _input_respond(
@@ -249,6 +255,12 @@ async def _input_respond(
     context, error_message = _context_from_params(params)
     if context is None:
         return build_error(command_id, "invalid_argument", error_message or "invalid params"), None
+
+    if isinstance(params.get("responses"), list) or params.get("interrupt_id") is not None:
+        unknown_id = await _non_pending_interrupt(session, thread_id, user, resume)
+        if unknown_id is not None:
+            message = f"Unknown or already-consumed interrupt: {unknown_id}"
+            return build_error(command_id, "no_such_interrupt", message), None
 
     assistant_id = params.get("assistant_id")
     if not isinstance(assistant_id, str) or not assistant_id:
@@ -322,6 +334,29 @@ def _build_resume(params: dict[str, Any]) -> tuple[Any, tuple[ErrorCode, str] | 
     if not isinstance(interrupt_id, str) or not _INTERRUPT_ID_PATTERN.fullmatch(interrupt_id):
         return None, ("no_such_interrupt", f"Unknown interrupt id {interrupt_id!r}.")
     return {interrupt_id: params["response"]}, None
+
+
+async def _non_pending_interrupt(
+    session: AsyncSession, thread_id: str, user: User, interrupt_ids: Iterable[str]
+) -> str | None:
+    """The first id not pending on the thread's latest checkpoint, or None.
+
+    Fails open while a run is in flight, as the official server does: that run may still raise or answer
+    interrupts, and run preparation's resume check decides.
+    """
+    if await _thread_status(session, thread_id, user) in (None, "busy"):
+        return None
+    saved = await db_manager.get_checkpointer().aget_tuple(
+        {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    )
+    pending_writes = (saved.pending_writes if saved else None) or []
+    pending = {
+        getattr(interrupt, "id", None)
+        for _task_id, channel, value in pending_writes
+        if channel == _INTERRUPT_CHANNEL
+        for interrupt in (value if isinstance(value, Sequence) else [value])
+    }
+    return next((interrupt_id for interrupt_id in interrupt_ids if interrupt_id not in pending), None)
 
 
 async def _thread_assistant_id(session: AsyncSession, thread_id: str, user: User) -> str | None:

@@ -4,6 +4,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 from aegra_api.models import User
 from aegra_api.services.event_streaming import commands as cmd
@@ -324,6 +325,77 @@ class TestInputRespond:
         prepared_run.assert_not_called()
 
 
+class TestInputRespondPendingInterrupts:
+    """input.respond answers only interrupts pending on the thread (official ``no_such_interrupt``)."""
+
+    async def test_non_pending_interrupt_is_no_such_interrupt(self, prepared_run: AsyncMock, user: User) -> None:
+        resp, run_id = await _dispatch(
+            {"id": 2, "method": "input.respond", "params": {"interrupt_id": "c" * 32, "response": "yes"}}, user
+        )
+        assert resp["error"] == "no_such_interrupt"
+        assert "c" * 32 in resp["message"]
+        assert run_id is None
+        prepared_run.assert_not_called()
+
+    async def test_batch_with_one_non_pending_interrupt_is_no_such_interrupt(
+        self, prepared_run: AsyncMock, user: User
+    ) -> None:
+        resp, run_id = await _dispatch(
+            {
+                "id": 2,
+                "method": "input.respond",
+                "params": {
+                    "assistant_id": "agent",
+                    "responses": [
+                        {"interrupt_id": "a" * 32, "response": "yes"},
+                        {"interrupt_id": "c" * 32, "response": "no"},
+                    ],
+                },
+            },
+            user,
+        )
+        assert resp["error"] == "no_such_interrupt"
+        assert run_id is None
+        prepared_run.assert_not_called()
+
+    async def test_thread_without_checkpoint_has_no_pending_interrupt(
+        self, prepared_run: AsyncMock, checkpointer: MagicMock, user: User
+    ) -> None:
+        checkpointer.aget_tuple.return_value = None
+        resp, _ = await _dispatch(
+            {"id": 2, "method": "input.respond", "params": {"interrupt_id": "a" * 32, "response": "yes"}}, user
+        )
+        assert resp["error"] == "no_such_interrupt"
+        prepared_run.assert_not_called()
+
+    async def test_busy_thread_fails_open_like_the_official_server(
+        self, prepared_run: AsyncMock, checkpointer: MagicMock, user: User
+    ) -> None:
+        """While a run is in flight the checkpoint can't say what is pending; run preparation decides."""
+        session = AsyncMock()
+        session.scalar = AsyncMock(return_value="busy")
+        resp, _ = await _dispatch(
+            {
+                "id": 2,
+                "method": "input.respond",
+                "params": {"assistant_id": "agent", "interrupt_id": "c" * 32, "response": "yes"},
+            },
+            user,
+            session=session,
+        )
+        assert resp["type"] == "success"
+        checkpointer.aget_tuple.assert_not_awaited()
+
+    async def test_untargeted_resume_skips_the_lookup(
+        self, prepared_run: AsyncMock, checkpointer: MagicMock, user: User
+    ) -> None:
+        resp, _ = await _dispatch(
+            {"id": 2, "method": "input.respond", "params": {"assistant_id": "agent", "response": "yes"}}, user
+        )
+        assert resp["type"] == "success"
+        checkpointer.aget_tuple.assert_not_awaited()
+
+
 class TestInputRespondCommandFields:
     """update / goto / context ride along with the resume (protocol InputRespondParams)."""
 
@@ -483,6 +555,29 @@ class TestErrors:
             {"id": 5, "method": "run.start", "params": {"assistant_id": "x", "input": {}}}, user
         )
         assert resp == {"type": "error", "id": 5, "error": "no_such_run", "message": "Assistant 'x' not found"}
+        assert run_id is None
+
+    async def test_prepare_http_409_maps_to_unknown_error(self, monkeypatch: pytest.MonkeyPatch, user: User) -> None:
+        """A busy-thread refusal is unknown_error, as the official server sends it; the protocol has no conflict code."""
+
+        async def busy(*_a: Any, **_k: Any) -> None:
+            raise HTTPException(409, "Thread is already running a task.")
+
+        monkeypatch.setattr(cmd, "_prepare_run", busy)
+        resp, run_id = await _dispatch(
+            {
+                "id": 5,
+                "method": "run.start",
+                "params": {"assistant_id": "x", "input": {}, "multitaskStrategy": "reject"},
+            },
+            user,
+        )
+        assert resp == {
+            "type": "error",
+            "id": 5,
+            "error": "unknown_error",
+            "message": "Thread is already running a task.",
+        }
         assert run_id is None
 
     async def test_prepare_http_403_maps_to_permission_denied(
