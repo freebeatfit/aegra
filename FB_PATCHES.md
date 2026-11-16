@@ -1,11 +1,15 @@
 # Freebeat patches on Aegra
 
-`freebeatfit/aegra` is a private fork of [aegra/aegra](https://github.com/aegra/aegra)
+`freebeatfit/aegra` is a public fork of [aegra/aegra](https://github.com/aegra/aegra)
 (Apache-2.0). Each `fb/<upstream version>` branch is the upstream release tag
 plus the commits below; releases are tagged `v<upstream version>+fb.<n>` and
-publish the `aegra-api` and `aegra-cli` wheels on a GitHub Release.
-`fb-super-agent` pins those wheels by URL and hash. Patches are not sent
-upstream.
+publish the `aegra-api` and `aegra-cli` wheels and their `SHA256SUMS` on a
+GitHub Release. `fb-super-agent` pins those wheels by release URL and hash, so
+installing them needs no credentials. Patches are not sent upstream.
+
+Every release bumps `+fb.<n>`: any change to the patches on the same upstream
+version is a new tag. A published release is never rebuilt or re-tagged,
+because `fb-super-agent` pins its hashes.
 
 A patch exists only where Aegra contradicts the LangGraph Agent Server, the
 Agent Protocol or the LangGraph SDK. Why the fork exists:

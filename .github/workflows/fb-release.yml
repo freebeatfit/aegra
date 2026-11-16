@@ -1,7 +1,7 @@
 name: FB release
 
 # Builds the patched aegra-api and aegra-cli wheels for a v<ver>+fb.<n> tag and
-# attaches them to a GitHub Release in this private fork. See FB_PATCHES.md.
+# attaches them to a GitHub Release in this public fork. See FB_PATCHES.md.
 on:
   push:
     tags:
