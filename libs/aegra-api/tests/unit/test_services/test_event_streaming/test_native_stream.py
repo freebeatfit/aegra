@@ -118,3 +118,135 @@ class TestStreamNativeV3Events:
         out = [pair async for pair in stream_native_v3_events(graph=graph, input_data={}, config={})]
         assert out
         assert "durability" not in graph.calls[0]
+
+
+def _real_graph() -> Any:
+    """A two-node graph with a checkpointer, so v3 emits values + checkpoints."""
+    from typing import TypedDict
+
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    class State(TypedDict):
+        messages: list[str]
+
+    def first(state: State) -> State:
+        return {"messages": [*state["messages"], "x" * 1000]}
+
+    def second(state: State) -> State:
+        return {"messages": [*state["messages"], "y" * 1000]}
+
+    builder = StateGraph(State)
+    builder.add_node("first", first)
+    builder.add_node("second", second)
+    builder.add_edge(START, "first")
+    builder.add_edge("first", "second")
+    builder.add_edge("second", END)
+    return builder.compile(checkpointer=InMemorySaver())
+
+
+@pytest.mark.asyncio
+class TestOnlyEnvelopeTransformer:
+    async def test_adds_no_updates_custom_or_tasks_channels(self) -> None:
+        """Aegra adds only the checkpoint envelope; other channels are graph opt-in."""
+        graph = _real_graph()
+        config = {"configurable": {"thread_id": "t-optin"}}
+        methods = {m async for m, _ in stream_native_v3_events(graph=graph, input_data={"messages": []}, config=config)}
+        assert "updates" not in methods
+        assert "tasks" not in methods
+        assert "custom" not in methods
+        assert {"values", "checkpoints"} <= methods
+
+    async def test_checkpoints_are_lightweight_envelopes(self) -> None:
+        """No full state on the checkpoints channel: only id/parent_id/step/source."""
+        graph = _real_graph()
+        config = {"configurable": {"thread_id": "t-envelope"}}
+        checkpoints = [
+            event["params"]["data"]
+            async for method, event in stream_native_v3_events(graph=graph, input_data={"messages": []}, config=config)
+            if method == "checkpoints"
+        ]
+        assert checkpoints
+        for envelope in checkpoints:
+            assert set(envelope) <= {"id", "parent_id", "step", "source"}
+            assert isinstance(envelope["id"], str)
+            assert isinstance(envelope["step"], int)
+        assert all("x" * 1000 not in repr(envelope) for envelope in checkpoints)
+        # Each envelope links to the previous checkpoint.
+        assert [e.get("parent_id") for e in checkpoints[1:]] == [e["id"] for e in checkpoints[:-1]]
+
+    async def test_values_still_carry_full_state(self) -> None:
+        graph = _real_graph()
+        config = {"configurable": {"thread_id": "t-values"}}
+        values = [
+            event["params"]["data"]
+            async for method, event in stream_native_v3_events(graph=graph, input_data={"messages": []}, config=config)
+            if method == "values"
+        ]
+        assert values[-1]["messages"] == ["x" * 1000, "y" * 1000]
+
+
+class TestCheckpointEnvelope:
+    def test_reduces_a_snapshot(self) -> None:
+        from aegra_api.services.event_streaming.native_stream import checkpoint_envelope
+
+        snapshot = {
+            "config": {"configurable": {"checkpoint_id": "c2", "checkpoint_ns": ""}},
+            "parent_config": {"configurable": {"checkpoint_id": "c1"}},
+            "metadata": {"step": 3, "source": "loop", "parents": {}},
+            "values": {"messages": ["big"]},
+            "next": ["model"],
+            "tasks": [],
+        }
+        assert checkpoint_envelope(snapshot) == {"id": "c2", "parent_id": "c1", "step": 3, "source": "loop"}
+
+    def test_root_checkpoint_has_no_parent(self) -> None:
+        from aegra_api.services.event_streaming.native_stream import checkpoint_envelope
+
+        snapshot = {"config": {"configurable": {"checkpoint_id": "c1"}}, "metadata": {"step": -1, "source": "input"}}
+        assert checkpoint_envelope(snapshot) == {"id": "c1", "step": -1, "source": "input"}
+
+    def test_envelope_passes_through(self) -> None:
+        from aegra_api.services.event_streaming.native_stream import checkpoint_envelope
+
+        envelope = {"id": "c1", "step": 0, "source": "loop"}
+        assert checkpoint_envelope(envelope) == envelope
+
+
+@pytest.mark.asyncio
+class TestEnvelopeOrder:
+    async def test_each_values_follows_its_checkpoint_envelope(self) -> None:
+        """The SDK pairs a buffered envelope with the next values on the namespace."""
+        graph = _real_graph()
+        config = {"configurable": {"thread_id": "t-order"}}
+        seq = [
+            (method, event["params"]["data"])
+            async for method, event in stream_native_v3_events(graph=graph, input_data={"messages": []}, config=config)
+            if method in ("values", "checkpoints")
+        ]
+        for index, (method, data) in enumerate(seq):
+            if method != "values":
+                continue
+            assert index > 0 and seq[index - 1][0] == "checkpoints"
+            # The envelope paired with values carrying N messages is step N - 1 (loop steps start at 0).
+            assert seq[index - 1][1]["step"] == len(data["messages"])
+
+    async def test_a_lone_values_event_is_not_lost(self) -> None:
+        graph = _FakeGraph([_event("values", {"a": 1}), _event("messages", [{"event": "message-start"}, {}])])
+        out = [method async for method, _ in stream_native_v3_events(graph=graph, input_data={}, config={})]
+        assert out == ["values", "messages"]
+
+    async def test_a_trailing_values_event_is_flushed(self) -> None:
+        graph = _FakeGraph([_event("values", {"a": 1})])
+        out = [method async for method, _ in stream_native_v3_events(graph=graph, input_data={}, config={})]
+        assert out == ["values"]
+
+    async def test_checkpoint_from_another_namespace_does_not_pair(self) -> None:
+        graph = _FakeGraph(
+            [
+                _event("values", {"a": 1}),
+                _event("checkpoints", {"id": "c", "step": 0}, namespace=["sub:1"]),
+            ]
+        )
+        out = [method async for method, _ in stream_native_v3_events(graph=graph, input_data={}, config={})]
+        assert out == ["values", "checkpoints"]
