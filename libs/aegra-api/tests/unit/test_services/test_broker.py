@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from prometheus_client import REGISTRY
 
 from aegra_api.services import broker as broker_module
 from aegra_api.services.base_broker import SNAPSHOT_MARKER, entry_key
@@ -84,6 +85,55 @@ class TestRunBroker:
 
         assert broker.is_finished()
         assert [event for *_rest, event in await manager.read_thread("t1", "0-0")] == [("end", {"status": "success"})]
+
+
+class _FailingManager(BrokerManager):
+    """Every write fails after its retries, as when Redis is down."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempted: list[Any] = []
+
+    async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> bool:
+        self.attempted.append(event)
+        return False
+
+    async def put_snapshot(
+        self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+    ) -> bool:
+        self.attempted.append(record)
+        return False
+
+
+def _lost() -> float:
+    return REGISTRY.get_sample_value("aegra_streaming_data_loss_total") or 0.0
+
+
+class TestPublishFailure:
+    @pytest.mark.asyncio
+    async def test_after_a_failed_write_the_run_stops_publishing_but_still_tries_its_terminal(self) -> None:
+        manager = _FailingManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        before = _lost()
+
+        for event in (("updates", {"i": 1}), _event("values", {"a": 1}), ("updates", {"i": 2})):
+            await broker.put(event)
+        await broker.put(("end", {"status": "success"}))
+
+        assert manager.attempted == [("updates", {"i": 1}), ("end", {"status": "success"})]
+        assert _lost() - before == 4
+        assert broker.is_finished()
+
+    @pytest.mark.asyncio
+    async def test_successful_writes_count_no_loss(self) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        before = _lost()
+
+        await broker.put(("updates", {"i": 1}))
+        await broker.put(("end", {"status": "success"}))
+
+        assert _lost() == before
 
 
 class TestThreadLog:

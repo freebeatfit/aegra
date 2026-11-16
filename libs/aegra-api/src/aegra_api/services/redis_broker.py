@@ -134,15 +134,15 @@ class RedisBrokerManager(BaseBrokerManager):
         base = f"{self._channel_prefix}thread:{{{thread_id}}}"
         return [f"{base}:events", f"{base}:snapshot-ids", f"{base}:snapshots"]
 
-    async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> None:
-        await self._write(thread_id, run_id, write_id, "", _serialize_payload(event))
+    async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> bool:
+        return await self._write(thread_id, run_id, write_id, "", _serialize_payload(event))
 
     async def put_snapshot(
         self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
-    ) -> None:
-        await self._write(thread_id, run_id, write_id, namespace, _serialize_payload(record))
+    ) -> bool:
+        return await self._write(thread_id, run_id, write_id, namespace, _serialize_payload(record))
 
-    async def _write(self, thread_id: str, run_id: str, write_id: str, namespace: str, payload: str) -> None:
+    async def _write(self, thread_id: str, run_id: str, write_id: str, namespace: str, payload: str) -> bool:
         window = settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
         args = [window * 1000, window, run_id, write_id, namespace, payload]
         attempt = 0
@@ -150,12 +150,12 @@ class RedisBrokerManager(BaseBrokerManager):
             try:
                 # EVALSHA, loading the script on a NOSCRIPT reply.
                 await redis_manager.get_client().register_script(_WRITE_SCRIPT)(keys=self._keys(thread_id), args=args)
-                return
+                return True
             except RedisError as e:
                 attempt += 1
                 if attempt >= _PUT_MAX_ATTEMPTS:
                     logger.error(f"Redis write failed for run {run_id} after {attempt} attempts: {e}")
-                    return
+                    return False
                 delay = _backoff_delay(attempt)
                 logger.warning(f"Redis write failed for run {run_id}, retrying in {delay:.1f}s: {e}", attempt=attempt)
                 await asyncio.sleep(delay)

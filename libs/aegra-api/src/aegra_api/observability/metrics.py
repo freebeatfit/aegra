@@ -40,6 +40,13 @@ THREAD_TTL_SWEPT = prometheus_client.Counter(
 for _outcome in ("deleted", "pruned", "error"):
     THREAD_TTL_SWEPT.labels(outcome=_outcome)
 
+STREAMING_DATA_LOSS = prometheus_client.Counter(
+    "aegra_streaming_data_loss_total",
+    "Run events not written to the thread's event log: the write that failed after its retries, "
+    "and every later event of that run, which is no longer published (its terminal is still tried). "
+    "The LangGraph Agent Server's streaming_data_loss_counter.",
+)
+
 
 def setup_prometheus_metrics(
     app: FastAPI,

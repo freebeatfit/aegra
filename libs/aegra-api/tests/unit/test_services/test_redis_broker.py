@@ -127,8 +127,9 @@ class TestAppend:
             patch("aegra_api.services.redis_broker.asyncio.sleep", new_callable=AsyncMock),
         ):
             mock_rm.get_client.return_value = client
-            await manager.append("t-1", "run-1", "w1", ("updates", {"a": 1}))
+            written = await manager.append("t-1", "run-1", "w1", ("updates", {"a": 1}))
 
+        assert written is False
         assert client.register_script.return_value.await_count == _PUT_MAX_ATTEMPTS
 
     @pytest.mark.asyncio
@@ -153,11 +154,12 @@ class TestAppend:
         order: list[str] = []
         gate = asyncio.Event()
 
-        async def append(thread_id: str, run_id: str, write_id: str, event: Any) -> None:
+        async def append(thread_id: str, run_id: str, write_id: str, event: Any) -> bool:
             order.append(f"{event[0]}-start")
             if event[0] == "updates":
                 await gate.wait()
             order.append(f"{event[0]}-end")
+            return True
 
         manager.append = append  # type: ignore[method-assign]
         broker = manager.get_or_create_broker("run-1", "t-1")

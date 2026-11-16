@@ -175,6 +175,10 @@ The counter increments only for confirmed operations: a successful Redis push fo
 
 All three series are exported as `0` from startup, so `rate()` queries and alerts work before the first recovery. A sustained non-zero rate of `crashed_retried` means workers are dying mid-run (check memory limits and crash loops); any growth in `crashed_exhausted` means runs are being lost permanently and is worth alerting on. In dev mode (`aegra dev`) the reaper does not run and these counters stay at zero.
 
+### Streaming data loss
+
+A run writes its events to its thread's event log with a bounded retry. When a write still fails, the run stops publishing its later events and finishes normally (its terminal event is still tried), as the LangGraph Agent Server does. `aegra_streaming_data_loss_total` counts the events not written. Any growth means open streams missed events; clients recover the thread's state when the run ends.
+
 The `/metrics` endpoint is **not** protected by Aegra's authentication middleware. This is intentional — Prometheus scrapers typically do not support application-level auth. If you need to restrict access, use network-level controls (firewall rules, internal load-balancer listeners, etc.).
 
 See the [environment variables reference](/reference/environment-variables#prometheus-metrics) for details.

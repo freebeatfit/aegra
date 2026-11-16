@@ -79,14 +79,16 @@ class BrokerManager(BaseBrokerManager):
             log = self._logs[thread_id] = _ThreadLog()
         return log
 
-    async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> None:
+    async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> bool:
         self._log(thread_id).write(run_id, write_id, event)
+        return True
 
     async def put_snapshot(
         self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
-    ) -> None:
+    ) -> bool:
         log = self._log(thread_id)
         log.snapshots[namespace] = (log.write(run_id, write_id, (SNAPSHOT_MARKER, namespace)), record)
+        return True
 
     async def read_thread(self, thread_id: str, after: str) -> list[ThreadEntry]:
         key = entry_key(after)

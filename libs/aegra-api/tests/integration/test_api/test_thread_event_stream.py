@@ -33,6 +33,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.stream.transformers import CustomTransformer
 from langgraph.types import interrupt
+from prometheus_client import REGISTRY
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -637,3 +638,27 @@ async def test_interrupt_reaches_a_client_that_reconnects(stream_server: _Server
     assert [request["payload"] for request in requests] == ["question?"]
     assert requests[0]["interrupt_id"]
     assert [status for status, _ in _root_lifecycle(fresh)] == ["running", "interrupted"]
+
+
+def _run_status(run_id: str) -> str | None:
+    with psycopg.connect(settings.db.database_url_sync) as conn:
+        row = conn.execute("SELECT status FROM runs WHERE run_id = %s", (run_id,)).fetchone()
+    return None if row is None else row[0]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_publish_lets_the_run_finish_and_counts_the_lost_events(
+    stream_server: _Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(redis_broker_module, "_BACKOFF_BASE", 0.01)
+    before = REGISTRY.get_sample_value("aegra_streaming_data_loss_total") or 0.0
+    thread_id = str(uuid4())
+    stream_server.redis.set(stream_server.broker.stream_key(thread_id), "not a stream")  # every write fails
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        run_id = await stream_server.start_run(http, thread_id, "loop:3:10")
+        async with asyncio.timeout(15):
+            while _run_status(run_id) in (None, "pending", "running"):
+                await asyncio.sleep(0.1)
+
+    assert _run_status(run_id) == "success"
+    assert (REGISTRY.get_sample_value("aegra_streaming_data_loss_total") or 0.0) - before >= 5

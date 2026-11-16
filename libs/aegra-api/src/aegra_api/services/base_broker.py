@@ -22,6 +22,7 @@ from uuid import uuid4
 import structlog
 
 from aegra_api.models.enums import RunCancellationAction
+from aegra_api.observability.metrics import STREAMING_DATA_LOSS
 
 logger = structlog.getLogger(__name__)
 
@@ -96,6 +97,8 @@ class RunBroker:
         self._write_lock = asyncio.Lock()
         # A checkpoints event waits for the values it precedes, to be stored with it.
         self._held: Any = None
+        # Set once a write failed after its retries: later events are dropped, not retried.
+        self._lost = False
 
     async def put(self, event: Any) -> None:
         """Append *event* (a ``(method, payload)`` pair) unless the run already ended."""
@@ -119,17 +122,37 @@ class RunBroker:
                 await self._append(event)
 
     async def _append(self, event: Any) -> None:
-        await self._manager.append(self.thread_id, self.run_id, uuid4().hex, event)
+        if self._skip(terminal=_method(event) in ("end", "error")):
+            return
+        self._count(await self._manager.append(self.thread_id, self.run_id, uuid4().hex, event))
 
     async def _snapshot(self, checkpoint: Any, values: Any) -> None:
+        if self._skip(terminal=False):
+            return
         record = {
             "run_id": self.run_id,
             "checkpoint": None if checkpoint is None else checkpoint[1],
             "values": values[1],
         }
-        await self._manager.put_snapshot(
-            self.thread_id, self.run_id, uuid4().hex, namespace_key(_namespace(values)), record
-        )
+        namespace = namespace_key(_namespace(values))
+        self._count(await self._manager.put_snapshot(self.thread_id, self.run_id, uuid4().hex, namespace, record))
+
+    def _skip(self, *, terminal: bool) -> bool:
+        """After a lost write, drop the run's later events (as the Agent Server does) but still try its terminal."""
+        if self._lost and not terminal:
+            STREAMING_DATA_LOSS.inc()
+            return True
+        return False
+
+    def _count(self, written: bool) -> None:
+        if written:
+            return
+        STREAMING_DATA_LOSS.inc()
+        if not self._lost:
+            logger.error(
+                "Stopped publishing the run's events after a failed write; the run continues", run_id=self.run_id
+            )
+        self._lost = True
 
     def mark_finished(self) -> None:
         self._finished = True
@@ -166,14 +189,17 @@ class BaseBrokerManager(ABC):
             await broker.put(("end", {"status": "interrupted"}))
 
     @abstractmethod
-    async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> None:
-        """Append one event to the thread's log. A write that keeps failing is logged, not raised."""
+    async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> bool:
+        """Append one event to the thread's log. False when the write failed after bounded retries."""
 
     @abstractmethod
     async def put_snapshot(
         self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
-    ) -> None:
-        """Replace *namespace*'s snapshot with *record* and append its marker, in one atomic write."""
+    ) -> bool:
+        """Replace *namespace*'s snapshot with *record* and append its marker, in one atomic write.
+
+        False when the write failed after bounded retries.
+        """
 
     @abstractmethod
     async def read_thread(self, thread_id: str, after: str) -> list[ThreadEntry]:
