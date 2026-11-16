@@ -15,7 +15,6 @@ from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_ctx import with_auth_ctx
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
-from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming.native_stream import stream_native_v3_events
 from aegra_api.services.langgraph_service import create_run_config, create_thread_config, get_langgraph_service
 from aegra_api.services.run_status import finalize_run, start_run
@@ -98,6 +97,7 @@ async def execute_run(job: RunJob) -> None:
                 await _best_effort_signal(
                     streaming_service.signal_run_error,
                     run_id,
+                    thread_id,
                     _TIMEOUT_SAFE_MESSAGE,
                     "TimeoutError",
                 )
@@ -111,7 +111,7 @@ async def execute_run(job: RunJob) -> None:
                 output={},
             )
             if finalized:
-                await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
+                await _best_effort_signal(streaming_service.signal_run_cancelled, run_id, thread_id)
         raise
     except Exception as exc:
         logger.exception("Run failed", run_id=run_id)
@@ -126,11 +126,13 @@ async def execute_run(job: RunJob) -> None:
             error=str(exc),
         )
         if finalized:
-            await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)
+            await _best_effort_signal(
+                streaming_service.signal_run_error, run_id, thread_id, safe_message, type(exc).__name__
+            )
     else:
         if finalized:
             status = "interrupted" if final_output.has_interrupt else "success"
-            await _best_effort_signal(_signal_end_event, run_id, status)
+            await _best_effort_signal(streaming_service.signal_run_end, run_id, status)
     finally:
         _lease_loss_cancellations.discard(run_id)
         _shutdown_cancellations.discard(run_id)
@@ -211,8 +213,7 @@ async def _stream_native_v2(
         context=job.execution.context,
         durability=job.execution.durability,
     ):
-        event_id = await broker_manager.allocate_event_id(run_id)
-        await streaming_service.put_to_broker(run_id, event_id, (method, event))
+        await streaming_service.put_to_broker(run_id, job.identity.thread_id, (method, event))
 
         params = event.get("params", {})
         data = params.get("data")
@@ -251,27 +252,6 @@ def _resolve_input(job: RunJob) -> Any:
     if job.execution.command is not None:
         return map_command_to_langgraph(job.execution.command)
     return job.execution.input_data
-
-
-# ------------------------------------------------------------------
-# End event (tells SSE consumers the stream is finished)
-# ------------------------------------------------------------------
-
-
-async def _signal_end_event(run_id: str, status: str) -> None:
-    """Publish an 'end' event to the broker so SSE consumers close cleanly.
-
-    Without this, the SSE connection hangs after the last data event
-    because the broker never signals completion on success/interrupt.
-    Error and cancel paths already send end events via signal_run_error
-    and signal_run_cancelled respectively.
-    """
-    broker = broker_manager.get_broker(run_id)
-    if broker is None or broker.is_finished():
-        return
-
-    event_id = await broker_manager.allocate_event_id(run_id)
-    await broker.put(event_id, ("end", {"status": status}))
 
 
 # ------------------------------------------------------------------

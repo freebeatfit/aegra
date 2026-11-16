@@ -349,7 +349,7 @@ class TestCancelRun:
 
             assert resp.status_code == 200
             mock_streaming.cancel_run.assert_awaited_once_with("test-run-123", emit_end_event=False)
-            mock_streaming.signal_run_cancelled.assert_awaited_once_with("test-run-123")
+            mock_streaming.signal_run_cancelled.assert_awaited_once_with("test-run-123", "test-thread-123")
 
 
 class TestCancelRuns:

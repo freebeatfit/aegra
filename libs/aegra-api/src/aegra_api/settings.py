@@ -343,6 +343,9 @@ class RedisSettings(EnvBase):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_CHANNEL_PREFIX: str = "aegra:run:"
     REDIS_MAX_CONNECTIONS: int = 250
+    # Pool for thread stream reads: each open stream holds one connection while it
+    # blocks. The LangGraph Agent Server's REDIS_STREAM_READ_MAX_CONNECTIONS default.
+    REDIS_STREAM_READ_MAX_CONNECTIONS: int = Field(default=2000, gt=0)
     # PING pooled connections idle longer than this (seconds) before reuse, so
     # server-side idle disconnects don't surface as ConnectionError. 0 disables.
     REDIS_HEALTH_CHECK_INTERVAL: int = Field(default=30, ge=0)

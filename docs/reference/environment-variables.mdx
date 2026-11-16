@@ -126,8 +126,9 @@ Aegra uses two connection pools: one for SQLAlchemy (metadata) and one for LangG
 |----------|---------|-------------|
 | `REDIS_BROKER_ENABLED` | `false` | Enable Redis for multi-instance SSE streaming and worker job dispatch |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
-| `REDIS_CHANNEL_PREFIX` | `aegra:run:` | Prefix for Redis pub/sub channels |
+| `REDIS_CHANNEL_PREFIX` | `aegra:run:` | Prefix for Redis keys and pub/sub channels |
 | `REDIS_MAX_CONNECTIONS` | `250` | Maximum Redis connection pool size |
+| `REDIS_STREAM_READ_MAX_CONNECTIONS` | `2000` | Connections for thread stream reads; each open stream holds one, and reads wait when all are in use |
 
 ## Workers
 

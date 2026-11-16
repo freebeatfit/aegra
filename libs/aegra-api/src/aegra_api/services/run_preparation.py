@@ -432,14 +432,6 @@ async def _prepare_run(
     session.add(run_orm)
     await session.commit()
 
-    # Wake open thread streams now instead of on their fallback re-read.
-    try:
-        from aegra_api.services.broker import broker_manager
-
-        await broker_manager.notify_thread(thread_id)
-    except Exception:  # noqa: BLE001 - a missed notice only delays discovery
-        logger.debug("Thread run notice failed", thread_id=thread_id, exc_info=True)
-
     run = Run.model_validate(run_orm)
 
     # Submit to executor

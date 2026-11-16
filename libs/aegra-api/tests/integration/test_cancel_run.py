@@ -13,7 +13,7 @@ from uuid import uuid4
 import pytest
 
 from aegra_api.core.active_runs import active_runs
-from aegra_api.services.broker import RunBroker, broker_manager
+from aegra_api.services.broker import broker_manager
 from aegra_api.services.streaming_service import streaming_service
 
 
@@ -48,10 +48,7 @@ class TestCancelRun:
         active_runs[run_id] = task
 
         # Create a broker for the run
-        broker = RunBroker(run_id)
-        if not hasattr(broker_manager, "_brokers"):
-            broker_manager._brokers = {}
-        broker_manager._brokers[run_id] = broker
+        broker_manager.get_or_create_broker(run_id, "thread-1")
 
         # Cancel the run
         result = await streaming_service.cancel_run(run_id)
@@ -82,10 +79,7 @@ class TestCancelRun:
         task = asyncio.create_task(cancellable_task())
         active_runs[run_id] = task
 
-        broker = RunBroker(run_id)
-        if not hasattr(broker_manager, "_brokers"):
-            broker_manager._brokers = {}
-        broker_manager._brokers[run_id] = broker
+        broker_manager.get_or_create_broker(run_id, "thread-1")
 
         # Interrupt the run
         result = await streaming_service.interrupt_run(run_id)
@@ -131,10 +125,7 @@ class TestCancelRunStatusNotOverwritten:
         task = asyncio.create_task(task_with_completion_check())
         active_runs[run_id] = task
 
-        broker = RunBroker(run_id)
-        if not hasattr(broker_manager, "_brokers"):
-            broker_manager._brokers = {}
-        broker_manager._brokers[run_id] = broker
+        broker_manager.get_or_create_broker(run_id, "thread-1")
 
         # Let it start
         await asyncio.sleep(0.1)

@@ -55,7 +55,7 @@ What it does:
 
 The generated `docker-compose.yml` includes:
 - PostgreSQL with pgvector
-- Redis for job dispatch, SSE pub/sub, and crash recovery
+- Redis for job dispatch, per-thread event streams, and crash recovery
 - Your app container built from `Dockerfile`
 - Health checks on both PostgreSQL and the API
 - `restart: unless-stopped` on all services — containers automatically restart on crashes or failed health checks, but respect manual `docker compose stop`

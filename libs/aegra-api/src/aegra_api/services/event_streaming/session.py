@@ -2,39 +2,33 @@
 
 A v2 stream is scoped to a *thread*, not a run (matching the LangGraph SDK):
 the client opens the stream, issues ``run.start``, and the events of whatever
-run(s) execute on the thread flow through. The run's broker already holds
+run(s) execute on the thread flow through. Every run on the thread appends its
 native protocol events (the v3 producer wrote them) as ``(method, event)``
-pairs, plus a terminal ``("end"|"error", payload)``. The session re-envelopes
-each under one thread-monotonic ``seq``: it restamps seq/event_id, filters by
-channel, splits interrupts onto the ``input`` channel, normalizes state
-message payloads, and derives the terminal lifecycle event.
+pairs, plus a terminal ``("end"|"error", payload)``, to one event log per
+thread. The session reads that log, as the LangGraph Agent Server does: from
+the oldest kept entry, then with bounded blocking reads from its cursor, so a
+run started after the stream opened arrives on it with no database polling.
+It restamps seq/event_id, filters by channel, splits interrupts onto the
+``input`` channel, normalizes state message payloads, and derives each run's
+root lifecycle.
 
-``seq`` is the reconnect cursor: a client resends the last ``seq`` it saw as
-``since`` and the session skips anything at or below it. ``event_id`` is a
-distinct unique-per-event string used by the client for dedup.
+``seq`` numbers up from the log entry id, so it rises across runs and is the
+same on every connection. ``event_id`` is ``<entry id>:<index>`` (root
+lifecycle: ``synth:<run_id>:...``), stable across replays for client dedup.
+``since`` filters what was already seen; the replay itself always starts at
+the oldest kept entry.
 
-What a connection replays (aligned with the LangGraph Agent Server, which
-replays the run in flight and leaves settled history to ``getState()``):
-
-* an active run (``pending``/``running``): its latest values snapshot and
-  every delta after it, then live events;
-* settled runs: only the newest one, compactly (its last state and how it
-  ended), so a client that subscribed late still sees the terminal and the
-  state it closed on; older settled runs are not read at all;
-* a ``since`` cursor at or past a run's last event skips that run's broker.
-
-The connection stays open with heartbeats until the client leaves. New runs
-are found from a thread notice (``broker_manager.notify_thread``) with a slow
-fallback read, not by polling the database.
+The first entry of a run id the session has not seen costs one ownership-
+filtered run lookup; runs the caller can't see are skipped.
 """
 
 from __future__ import annotations
 
-import asyncio
+import dataclasses
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from aegra_api.services.base_broker import entry_key
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming.channels import is_supported_channel
 from aegra_api.services.event_streaming.normalizers import (
@@ -45,33 +39,31 @@ from aegra_api.services.event_streaming.normalizers import (
     strip_interrupts,
 )
 from aegra_api.services.event_streaming.protocol import build_event
-from aegra_api.services.replay_policy import is_after
-from aegra_api.utils import extract_event_sequence
 
-__all__ = ["RunLister", "ThreadEventSession", "validate_channels"]
+__all__ = ["RunLookup", "ThreadEventSession", "validate_channels"]
 
-# Fallback re-read of the thread's runs when no notice arrives (a lost publish,
-# a run created by an older instance). Notices make new runs visible at once.
-_RUN_DISCOVERY_FALLBACK_SECONDS = 5.0
-# Settled runs that still have buffered events, newest first, that a
-# connection replays compactly. One: the run the client may have just missed.
-_SETTLED_RUNS_REPLAYED = 1
-_ACTIVE_RUN_STATUSES = frozenset({"pending", "running"})
+# Async callable: the run's graph name ("" when unknown), or None when the caller can't see the run.
+RunLookup = Callable[[str], Awaitable[str | None]]
 
-# Async callable returning the thread's (run_id, status, graph_name, created_at) rows, oldest
-# first. Status backstops expired runs (see _drain_run); created_at anchors the run's seq.
-RunLister = Callable[[], Awaitable[list[tuple[str, str | None, str | None, datetime | None]]]]
-
-_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-# seq slots per broker event: one broker event can project to several wire events.
-_SEQ_SLOTS_PER_EVENT = 16
-# Larger id suffixes are allocate_event_id's epoch-ms fallback, not a per-run count.
-_MAX_EVENT_ORDINAL = 1_000_000_000
-
-_TERMINAL_RUN_STATUSES = frozenset({"success", "error", "timeout", "interrupted"})
+# seq of a log entry "<ms>-<n>" is ((ms << 8) + n) << 3: 8 slots for the wire events one
+# entry projects to, and below 2**53 (JS-safe) until 2109. max() keeps it rising on overflow.
+_SEQ_SLOT_BITS = 3
+_SEQ_N_BITS = 8
 
 # A projected channel event: (wire method, params.data, namespace).
 _ChannelEvent = tuple[str, dict[str, Any], list[str]]
+
+
+@dataclasses.dataclass
+class _RunView:
+    """What the session tracks for one visible run until its terminal."""
+
+    graph: str
+    # Subgraph namespaces started but not yet completed, closed by the terminal.
+    open_namespaces: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    # One input.requested per interrupt: it can surface via updates and the next values.
+    sent_interrupts: set[str] = dataclasses.field(default_factory=set)
+    last_write: str | None = None
 
 
 class ThreadEventSession:
@@ -82,201 +74,71 @@ class ThreadEventSession:
         thread_id: str,
         *,
         channels: set[str],
-        list_run_ids: RunLister,
+        lookup_run: RunLookup,
         since: int | None = None,
         namespaces: list[list[str]] | None = None,
         depth: int | None = None,
-        discovery_fallback_seconds: float = _RUN_DISCOVERY_FALLBACK_SECONDS,
-        max_idle_seconds: float | None = None,
     ) -> None:
         self._thread_id = thread_id
         self._channels = channels
-        self._list_run_ids = list_run_ids
+        self._lookup_run = lookup_run
         self._since = since
         self._namespaces = [tuple(prefix) for prefix in namespaces] if namespaces else None
         self._depth = depth
-        self._discovery_fallback = discovery_fallback_seconds
-        # None: stay open until the client disconnects (the server default).
-        self._max_idle = max_idle_seconds
         self._seq = 0
-        self._drained: set[str] = set()
-        # One input.requested per interrupt per session — the same interrupt can
-        # surface via updates (__interrupt__ node) AND the next values snapshot.
-        self._sent_interrupts: set[str] = set()
-        # Per-run lifecycle bookkeeping, reset by _drain_run: the run's root
-        # graph name and the subgraph namespaces still open (started, no
-        # completed/failed yet) so the terminal can cascade-close them.
-        self._current_run: str | None = None
-        self._run_seq_base: int | None = None
-        self._current_graph: str | None = None
-        self._open_namespaces: dict[str, list[str]] = {}
-
-    @property
-    def applied_through_seq(self) -> int:
-        """The highest seq assigned so far (the SDK's initial cursor)."""
-        return self._seq
+        # run_id -> its view, or None once it ended or when the caller can't see it.
+        self._runs: dict[str, _RunView | None] = {}
+        self._run_id = ""
+        self._view = _RunView(graph="")
 
     async def stream(self) -> AsyncIterator[dict[str, Any]]:
         """Yield v2 envelopes for the thread's runs until the client disconnects.
 
-        The stream stays open across the gap between runs so a HITL resume
-        (``input.respond`` starts a fresh run on the same thread) is delivered
-        on the same SSE connection the SDK holds open; the SSE layer sends
-        heartbeats meanwhile. A new run is picked up when its creation notice
-        arrives, or at the latest after the fallback interval.
+        Never ends on its own: an idle thread stream blocks on the log while
+        the SSE layer sends heartbeats. A failed read raises.
         """
-        loop = asyncio.get_running_loop()
-        idle_since = loop.time()
-        first = True
-        async with broker_manager.thread_waiter(self._thread_id) as waiter:
-            while True:
-                waiter.clear()
-                rows = await self._list_run_ids()
-                plan = self._plan(rows, first=first)
-                first = False
-                progressed = False
-                for run_id, run_status, graph_name, created_at, settled in plan:
-                    async for envelope in self._drain_run(run_id, run_status, graph_name, created_at, settled=settled):
-                        progressed = True
-                        yield envelope
-                    self._drained.add(run_id)
-                for row in rows:
-                    if row[1] not in _ACTIVE_RUN_STATUSES:
-                        self._drained.add(row[0])
-
-                if progressed:
-                    idle_since = loop.time()
-                    continue
-                if self._max_idle is not None and loop.time() - idle_since >= self._max_idle:
-                    return
-                await waiter.wait(self._discovery_fallback)
-
-    def _plan(
-        self, rows: list[tuple[str, str | None, str | None, datetime | None]], *, first: bool
-    ) -> list[tuple[str, str | None, str | None, datetime | None, bool]]:
-        """Which runs to drain now, oldest first, and whether each is settled.
-
-        Active runs are always drained in full. On the connection's first read,
-        the newest settled runs are replayed compactly; settled runs that show
-        up later (a run that finished between two reads) are drained in full,
-        since this connection never saw them start.
-        """
-        fresh = [row for row in rows if row[0] not in self._drained]
-        settled = [row for row in fresh if row[1] not in _ACTIVE_RUN_STATUSES]
-        keep_settled = {row[0] for row in settled[-_SETTLED_RUNS_REPLAYED:]} if first else {row[0] for row in settled}
-        plan: list[tuple[str, str | None, str | None, datetime | None, bool]] = []
-        for run_id, status, graph_name, created_at in fresh:
-            if status in _ACTIVE_RUN_STATUSES:
-                plan.append((run_id, status, graph_name, created_at, False))
-            elif run_id in keep_settled:
-                plan.append((run_id, status, graph_name, created_at, first))
-        return plan
-
-    def _cursor_for(self, created_at: datetime | None) -> str | None:
-        """The broker event id the client's ``since`` already covers in this run.
-
-        ``seq`` is ``run_base + ordinal * slots (+ index)``, so ``since`` maps
-        back to the last ordinal it saw. None replays the run from its start.
-        """
-        if self._since is None or created_at is None:
-            return None
-        base = _run_seq_base(created_at)
-        if self._since < base:
-            return None
-        ordinal = (self._since - base) // _SEQ_SLOTS_PER_EVENT
-        if ordinal <= 0:
-            return None
-        return f"{self._current_run}_event_{ordinal}"
-
-    async def _drain_run(
-        self,
-        run_id: str,
-        run_status: str | None,
-        graph_name: str | None,
-        created_at: datetime | None,
-        *,
-        settled: bool = False,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """Replay then tail one run's broker, re-enveloping each native event.
-
-        Each run's lifecycle tree is self-contained on the stream: a root
-        ``running`` seed opens it, per-subgraph events flow through, and the
-        terminal closes any still-open subgraph namespaces before the root
-        status (a cancel mid-subgraph otherwise leaves them started forever).
-
-        Replay starts at the client's ``since`` cursor and reads the broker in
-        batches. A settled run replays compactly (``replay_settled``).
-
-        The persisted run status backstops runs whose broker events expired
-        (replay TTL / cleanup): without it, ``aiter`` on a recreated empty
-        broker waits forever for an end event nobody will publish — wedging
-        the whole thread stream on its first historical run. A terminal run
-        with no surviving events drains silently; one whose events survived
-        but whose end frame was lost gets a synthesized terminal.
-        """
-        broker = broker_manager.get_or_create_broker(run_id)
-        seen: set[str] = set()
-        self._sent_interrupts = set()
-        self._current_run = run_id
-        self._current_graph = graph_name
-        self._run_seq_base = _run_seq_base(created_at) if created_at is not None else None
-        if self._run_seq_base is not None:
-            self._seq = max(self._seq, self._run_seq_base)
-        self._open_namespaces = {}
-        cursor = self._cursor_for(created_at)
-
-        if settled:
-            replay: AsyncIterator[tuple[str, Any]] = _aiter_list(await broker.replay_settled(cursor))
-        else:
-            replay = broker.replay_iter(cursor)
-
-        started = False
-        async for event_id, raw_event in replay:
-            if not started:
-                started = True
-                for envelope in self._emit(
-                    [("lifecycle", self._root_lifecycle("running"), [])], f"synth:{run_id}:running"
-                ):
+        cursor = "0-0"
+        while True:
+            for entry_id, run_id, write_id, raw_event in await broker_manager.read_thread(self._thread_id, cursor):
+                cursor = entry_id
+                for envelope in await self._ingest(entry_id, run_id, write_id, raw_event):
                     yield envelope
-            seen.add(event_id)
-            for envelope in self._project(event_id, raw_event):
-                yield envelope
-            if _is_terminal(raw_event):
-                return
 
-        if run_status in _TERMINAL_RUN_STATUSES:
-            if not started:
-                return
-            for envelope in self._project(f"{run_id}:status-end", ("end", {"status": run_status})):
-                yield envelope
-            return
+    async def _ingest(self, entry_id: str, run_id: str, write_id: str, raw_event: Any) -> list[dict[str, Any]]:
+        """Project one log entry; the first entry of a run also opens its root lifecycle."""
+        first = run_id not in self._runs
+        if first:
+            graph = await self._lookup_run(run_id)
+            self._runs[run_id] = None if graph is None else _RunView(graph=graph)
+        view = self._runs[run_id]
+        # A retried write lands twice with the same write id.
+        if view is None or write_id == view.last_write:
+            return []
+        view.last_write = write_id
+        self._run_id, self._view = run_id, view
+        ms, n = entry_key(entry_id)
+        self._seq = max(self._seq, ((ms << _SEQ_N_BITS) + n) << _SEQ_SLOT_BITS)
 
-        if not started:
-            for envelope in self._emit([("lifecycle", self._root_lifecycle("running"), [])], f"synth:{run_id}:running"):
-                yield envelope
-
-        async for event_id, raw_event in broker.aiter():
-            if event_id in seen:
-                continue
-            if cursor is not None and not is_after(event_id, cursor):
-                continue
-            for envelope in self._project(event_id, raw_event):
-                yield envelope
-            if _is_terminal(raw_event):
-                return
+        envelopes: list[dict[str, Any]] = []
+        if first:
+            envelopes = self._emit([("lifecycle", self._root_lifecycle("running"), [])], f"synth:{run_id}:running")
+        else:
+            # The running seed's slot, so an entry's seqs don't depend on where the replay started.
+            self._seq += 1
+        envelopes += self._project(entry_id, raw_event)
+        if _is_terminal(raw_event):
+            # The run ended: drop its state and ignore anything it writes after.
+            self._runs[run_id] = None
+        return envelopes
 
     def _project(self, event_id: str, raw_event: Any) -> list[dict[str, Any]]:
-        """Re-envelope one raw broker event into filtered, seq'd envelopes."""
+        """Re-envelope one raw log event into filtered, seq'd envelopes."""
         method, payload = _unwrap(raw_event)
         if method is None:
             return []
-        ordinal = extract_event_sequence(event_id)
-        if self._run_seq_base is not None and 0 < ordinal < _MAX_EVENT_ORDINAL:
-            # Number from the broker's stored ordinal, so a replay buffer trimmed by Redis keeps each event's seq.
-            self._seq = max(self._seq, self._run_seq_base + ordinal * _SEQ_SLOTS_PER_EVENT)
         if method in ("end", "error"):
             # The SDK reads the run of a root lifecycle event from a synth:<run_id>: id.
-            event_id = f"synth:{self._current_run}:{method}"
+            event_id = f"synth:{self._run_id}:{method}"
         params = payload.get("params") if isinstance(payload, dict) else None
         timestamp = params.get("timestamp") if isinstance(params, dict) else None
         return self._emit(self._channel_events(method, payload), event_id, timestamp=timestamp)
@@ -369,9 +231,9 @@ class ThreadEventSession:
         for request in requests:
             interrupt_id = request.get("interrupt_id")
             if isinstance(interrupt_id, str):
-                if interrupt_id in self._sent_interrupts:
+                if interrupt_id in self._view.sent_interrupts:
                     continue
-                self._sent_interrupts.add(interrupt_id)
+                self._view.sent_interrupts.add(interrupt_id)
             events.append(("input.requested", request, namespace))
         return events
 
@@ -398,9 +260,9 @@ class ThreadEventSession:
         event = data["event"]
         key = "\0".join(namespace)
         if event == "started":
-            self._open_namespaces[key] = list(namespace)
+            self._view.open_namespaces[key] = list(namespace)
         elif event in ("completed", "failed"):
-            self._open_namespaces.pop(key, None)
+            self._view.open_namespaces.pop(key, None)
 
         forwarded: dict[str, Any] = {"event": event}
         for field in ("graph_name", "trigger_call_id", "error", "cause"):
@@ -425,9 +287,9 @@ class ThreadEventSession:
             status = "error"
 
         events: list[_ChannelEvent] = []
-        for namespace in sorted(self._open_namespaces.values(), key=_namespace_depth, reverse=True):
+        for namespace in sorted(self._view.open_namespaces.values(), key=_namespace_depth, reverse=True):
             events.append(("lifecycle", {"event": "completed"}, namespace))
-        self._open_namespaces = {}
+        self._view.open_namespaces.clear()
 
         data = self._root_lifecycle(lifecycle_status(status or ""))
         if isinstance(payload, dict) and (message := payload.get("message")):
@@ -438,8 +300,8 @@ class ThreadEventSession:
     def _root_lifecycle(self, status: str) -> dict[str, Any]:
         """Root-namespace lifecycle data, carrying the run's graph name when known."""
         data: dict[str, Any] = {"event": status}
-        if self._current_graph:
-            data["graph_name"] = self._current_graph
+        if self._view.graph:
+            data["graph_name"] = self._view.graph
         return data
 
     def _wants(self, channel: str, data: dict[str, Any] | None = None) -> bool:
@@ -473,18 +335,6 @@ class ThreadEventSession:
         if self._namespaces is None:
             return True
         return any(_prefix_matches(namespace, prefix) for prefix in self._namespaces)
-
-
-async def _aiter_list(items: list[tuple[str, Any]]) -> AsyncIterator[tuple[str, Any]]:
-    for item in items:
-        yield item
-
-
-def _run_seq_base(created_at: datetime) -> int:
-    """Microseconds since the epoch: the run's events number up from here on every connection."""
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=UTC)
-    return (created_at - _EPOCH) // timedelta(microseconds=1)
 
 
 def _namespace_depth(namespace: list[str]) -> int:

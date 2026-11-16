@@ -1,47 +1,66 @@
 """Tests for ThreadEventSession: native-event forwarding, seq, filter, since, HITL, lifecycle."""
 
 import asyncio
+import contextlib
 from collections.abc import Iterator
-from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
+from aegra_api.services import broker as broker_module
+from aegra_api.services.base_broker import ThreadEntry, entry_key
 from aegra_api.services.broker import BrokerManager
 from aegra_api.services.event_streaming import session as session_module
 from aegra_api.services.event_streaming.session import (
-    RunLister,
+    RunLookup,
     ThreadEventSession,
     validate_channels,
 )
 
 
+class _Drained(Exception):
+    """The thread's log has nothing more to read."""
+
+
+class _DrainingBrokerManager(BrokerManager):
+    """In-memory broker whose read raises once the log is drained, so a session ends."""
+
+    async def read_thread(self, thread_id: str, after: str) -> list[ThreadEntry]:
+        entries = self._log(thread_id).after(entry_key(after))
+        if not entries:
+            raise _Drained
+        return entries
+
+
 @pytest.fixture
 def manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[BrokerManager]:
     """Swap in a fresh in-memory broker manager for the session under test."""
-    mgr = BrokerManager()
+    mgr = _DrainingBrokerManager()
     monkeypatch.setattr(session_module, "broker_manager", mgr)
     yield mgr
 
 
-def _lister(
-    *run_ids: str,
-    statuses: dict[str, str] | None = None,
-    graph: str | None = None,
-    created: dict[str, datetime] | None = None,
-) -> RunLister:
-    """Run lister returning (run_id, status, graph_name, created_at) rows; status defaults to running."""
+@pytest.fixture
+def live_manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[BrokerManager]:
+    """An in-memory broker whose reads block briefly, like a live thread stream."""
+    mgr = BrokerManager()
+    monkeypatch.setattr(session_module, "broker_manager", mgr)
+    monkeypatch.setattr(broker_module, "_READ_WAIT_SECONDS", 0.05)
+    yield mgr
 
-    async def list_run_ids() -> list[tuple[str, str | None, str | None, datetime | None]]:
-        return [
-            (run_id, (statuses or {}).get(run_id, "running"), graph, (created or {}).get(run_id)) for run_id in run_ids
-        ]
 
-    return list_run_ids
+def _lookup(graph: str | None = None, *, hidden: tuple[str, ...] = ()) -> RunLookup:
+    """Run lookup: every run is visible with *graph* except the *hidden* ones."""
+
+    async def lookup(run_id: str) -> str | None:
+        return None if run_id in hidden else (graph or "")
+
+    return lookup
 
 
 def _protocol_event(method: str, data: Any, *, namespace: list[str] | None = None, **params: Any) -> dict[str, Any]:
-    """A native v3 ProtocolEvent as it sits in the broker for a v2 run."""
+    """A native v3 ProtocolEvent as a v2 run writes it to the thread's log."""
     return {
         "type": "event",
         "method": method,
@@ -49,10 +68,9 @@ def _protocol_event(method: str, data: Any, *, namespace: list[str] | None = Non
     }
 
 
-async def _seed(manager: BrokerManager, run_id: str, events: list[tuple[str, Any]]) -> None:
-    broker = manager.get_or_create_broker(run_id)
-    for i, raw in enumerate(events, start=1):
-        await broker.put(f"{run_id}_event_{i}", raw)
+async def _seed(manager: BrokerManager, run_id: str, events: list[tuple[str, Any]], *, thread_id: str = "t1") -> None:
+    for raw in events:
+        await manager.append(thread_id, run_id, uuid4().hex, raw)
 
 
 def _msg_event(event_kind: str, **extra: Any) -> tuple[str, dict[str, Any]]:
@@ -63,27 +81,50 @@ def _make_session(
     thread_id: str,
     *,
     channels: set[str],
-    run_ids: tuple[str, ...],
     since: int | None = None,
     namespaces: list[list[str]] | None = None,
     depth: int | None = None,
-    statuses: dict[str, str] | None = None,
     graph: str | None = None,
-    created: dict[str, datetime] | None = None,
+    lookup_run: RunLookup | None = None,
 ) -> ThreadEventSession:
     return ThreadEventSession(
         thread_id,
         channels=channels,
-        list_run_ids=_lister(*run_ids, statuses=statuses, graph=graph, created=created),
+        lookup_run=lookup_run or _lookup(graph),
         since=since,
         namespaces=namespaces,
         depth=depth,
-        max_idle_seconds=0.0,
     )
 
 
 async def _collect(session: ThreadEventSession) -> list[dict[str, Any]]:
-    return [evt async for evt in session.stream()]
+    """Every envelope the session yields until the log is drained."""
+    events: list[dict[str, Any]] = []
+    with contextlib.suppress(_Drained):
+        async for event in session.stream():
+            events.append(event)
+    return events
+
+
+def _root_ended(event: dict[str, Any]) -> bool:
+    return (
+        event["method"] == "lifecycle"
+        and not event["params"]["namespace"]
+        and event["params"]["data"].get("event") != "running"
+    )
+
+
+async def _read_until_runs_end(session: ThreadEventSession, runs: int) -> list[dict[str, Any]]:
+    """Read a live session until *runs* root terminals arrived."""
+    events: list[dict[str, Any]] = []
+    stream = session.stream()
+    async with asyncio.timeout(2.0):
+        async for event in stream:
+            events.append(event)
+            if sum(_root_ended(e) for e in events) == runs:
+                break
+    await stream.aclose()
+    return events
 
 
 class TestForwarding:
@@ -98,7 +139,7 @@ class TestForwarding:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"messages", "lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"messages", "lifecycle"}))
         kinds = [(e["method"], e["params"]["data"].get("event")) for e in events]
         assert kinds == [
             ("lifecycle", "running"),
@@ -117,14 +158,14 @@ class TestForwarding:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
         assert [e["method"] for e in events] == ["lifecycle", "values", "lifecycle"]
         assert events[1]["params"]["timestamp"] == 1_700_000_000_000
         assert events[0]["params"]["timestamp"] > 1_700_000_000_000
 
     async def test_values_payload_in_params_data(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
-        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"values"}))
         assert events[0]["params"]["data"] == {"a": 1}
         assert events[0]["params"]["namespace"] == []
 
@@ -134,7 +175,7 @@ class TestForwarding:
             "run-1",
             [("values", _protocol_event("values", {"a": 1}, namespace=["sub:1"])), ("end", {"status": "success"})],
         )
-        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"values"}))
         assert events[0]["params"]["namespace"] == ["sub:1"]
 
     async def test_tools_channel_forwarded(self, manager: BrokerManager) -> None:
@@ -146,7 +187,7 @@ class TestForwarding:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"tools"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"tools"}))
         assert events[0]["params"]["data"] == {"event": "tool-started", "tool_call_id": "c1"}
 
     async def test_raw_v3_updates_normalized_to_node_values(self, manager: BrokerManager) -> None:
@@ -156,7 +197,7 @@ class TestForwarding:
             "run-1",
             [("updates", _protocol_event("updates", {"worker": {"count": 1}})), ("end", {"status": "success"})],
         )
-        events = await _collect(_make_session("t1", channels={"updates"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"updates"}))
         assert events[0]["params"]["data"] == {"node": "worker", "values": {"count": 1}}
 
     async def test_interrupt_node_in_updates_routes_to_input(self, manager: BrokerManager) -> None:
@@ -169,7 +210,7 @@ class TestForwarding:
                 ("end", {"status": "interrupted"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"input", "updates"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"input", "updates"}))
         input_events = [e for e in events if e["method"] == "input.requested"]
         assert input_events[0]["params"]["data"] == {
             "interrupt_id": "int-9",
@@ -180,17 +221,24 @@ class TestForwarding:
 
 
 class TestSeqAndFilter:
-    async def test_seq_monotonic_from_one(self, manager: BrokerManager) -> None:
+    async def test_seq_numbers_up_from_the_log_entry_id(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
-        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",)))
-        # seq 1 = the run's root lifecycle running seed.
-        assert [e["seq"] for e in events] == [1, 2, 3]
+        entry_id = manager._log("t1").entries[0][0]
+        ms, n = entry_key(entry_id)
 
-    async def test_seq_spans_multiple_runs(self, manager: BrokerManager) -> None:
+        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+
+        # The run's running seed takes the first slot of its first entry, the values the next.
+        assert [e["seq"] for e in events[:2]] == [((ms << 8) + n << 3) + 1, ((ms << 8) + n << 3) + 2]
+        assert events[1]["event_id"] == f"{entry_id}:0"
+
+    async def test_seq_rises_across_runs(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
         await _seed(manager, "run-2", [("values", _protocol_event("values", {"a": 2})), ("end", {"status": "success"})])
-        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1", "run-2")))
-        assert [e["seq"] for e in events] == [1, 2, 3, 4, 5, 6]
+        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+        seqs = [e["seq"] for e in events]
+        assert len(events) == 6
+        assert seqs == sorted(set(seqs))
 
     async def test_channel_filter_drops_unsubscribed(self, manager: BrokerManager) -> None:
         await _seed(
@@ -202,7 +250,7 @@ class TestSeqAndFilter:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"values"}))
         assert {e["method"] for e in events} == {"values"}
 
     async def test_seq_absolute_not_filter_relative(self, manager: BrokerManager) -> None:
@@ -215,9 +263,11 @@ class TestSeqAndFilter:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
-        # running seed = seq 1; values/updates burn 2-3 unsubscribed; terminal = 4.
-        assert [(e["method"], e["seq"]) for e in events] == [("lifecycle", 1), ("lifecycle", 4)]
+        everything = await _collect(_make_session("t1", channels={"values", "updates", "lifecycle"}))
+        lifecycle = await _collect(_make_session("t1", channels={"lifecycle"}))
+        assert [(e["event_id"], e["seq"]) for e in lifecycle] == [
+            (e["event_id"], e["seq"]) for e in everything if e["method"] == "lifecycle"
+        ]
 
     async def test_since_skips_already_seen(self, manager: BrokerManager) -> None:
         await _seed(
@@ -229,108 +279,61 @@ class TestSeqAndFilter:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",), since=1))
-        # The broker keeps only the newest values snapshot of a v2 run, so the
-        # superseded {"a": 1} is gone; seq stays absolute (running seed = 1).
-        assert [e["seq"] for e in events] == [2, 3]
-        assert [e["params"]["data"] for e in events if e["method"] == "values"] == [{"a": 2}]
-
-    async def test_applied_through_seq_tracks_max(self, manager: BrokerManager) -> None:
-        await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
-        session = _make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",))
-        await _collect(session)
-        assert session.applied_through_seq == 3
+        full = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+        resumed = await _collect(_make_session("t1", channels={"values", "lifecycle"}, since=full[1]["seq"]))
+        assert [(e["seq"], e["event_id"]) for e in resumed] == [(e["seq"], e["event_id"]) for e in full[2:]]
+        assert [e["params"]["data"] for e in resumed if e["method"] == "values"] == [{"a": 2}]
 
     async def test_seq_is_the_same_on_every_connection(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
-        created = {"run-1": datetime(2026, 1, 1, tzinfo=UTC)}
 
-        first = await _collect(
-            _make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",), created=created)
-        )
-        second = await _collect(
-            _make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",), created=created)
-        )
+        first = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+        second = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
 
-        assert [e["seq"] for e in first] == [e["seq"] for e in second]
+        assert [(e["seq"], e["event_id"]) for e in first] == [(e["seq"], e["event_id"]) for e in second]
 
-    async def test_seq_survives_a_trimmed_replay_buffer(self, manager: BrokerManager) -> None:
-        """Redis keeps only the newest events per run; a retained event keeps the seq it had before the trim."""
+    async def test_seq_survives_a_trimmed_log(self, manager: BrokerManager) -> None:
+        """A retained entry keeps the seq and event id it had before older entries were trimmed."""
         events = [("updates", _protocol_event("updates", {"node": {"i": i}})) for i in range(1, 6)] + [
             ("end", {"status": "success"})
         ]
         await _seed(manager, "run-1", events)
-        created = {"run-1": datetime(2026, 1, 1, tzinfo=UTC)}
-        full = await _collect(
-            _make_session("t1", channels={"updates", "lifecycle"}, run_ids=("run-1",), created=created)
-        )
-        manager.remove_broker("run-1")
-        broker = manager.get_or_create_broker("run-1")
-        for i, raw in enumerate(events, start=1):
-            if i > 3:  # the first three events were trimmed
-                await broker.put(f"run-1_event_{i}", raw)
+        full = await _collect(_make_session("t1", channels={"updates", "lifecycle"}))
+        for _ in range(3):
+            manager._log("t1").entries.popleft()
 
-        trimmed = await _collect(
-            _make_session("t1", channels={"updates", "lifecycle"}, run_ids=("run-1",), created=created)
-        )
-        resumed = await _collect(
-            _make_session(
-                "t1", channels={"updates", "lifecycle"}, run_ids=("run-1",), created=created, since=full[3]["seq"]
-            )
-        )
+        trimmed = await _collect(_make_session("t1", channels={"updates", "lifecycle"}))
 
         seq_by_id = {e["event_id"]: e["seq"] for e in full}
+        assert [e["event_id"] for e in trimmed[1:]] == [e["event_id"] for e in full[4:]]
         assert [e["seq"] for e in trimmed[1:]] == [seq_by_id[e["event_id"]] for e in trimmed[1:]]
-        assert [e["event_id"] for e in resumed] == [e["event_id"] for e in full[4:]]
-
-    async def test_fallback_event_id_does_not_jump_seq(self, manager: BrokerManager) -> None:
-        """An epoch-ms id from the allocator's Redis fallback is not an event count."""
-        broker = manager.get_or_create_broker("run-1")
-        await broker.put("run-1_event_1", ("updates", _protocol_event("updates", {"n": {"a": 1}})))
-        await broker.put("run-1_event_1794574673377", ("updates", _protocol_event("updates", {"n": {"a": 2}})))
-        await broker.put("run-1_event_3", ("end", {"status": "success"}))
-        created = {"run-1": datetime(2026, 1, 1, tzinfo=UTC)}
-
-        events = await _collect(
-            _make_session("t1", channels={"updates", "lifecycle"}, run_ids=("run-1",), created=created)
-        )
-
-        base = events[0]["seq"] - 1
-        assert [e["seq"] - base for e in events] == [1, 17, 18, 49]
 
     async def test_seq_keeps_rising_after_earlier_runs_expire(self, manager: BrokerManager) -> None:
         """#751: a new connection must not number a new run below seqs the client already saw."""
-        created = {"run-1": datetime(2026, 1, 1, 12, tzinfo=UTC), "run-2": datetime(2026, 1, 1, 12, 15, tzinfo=UTC)}
-        statuses = {"run-1": "success", "run-2": "success"}
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
-        first = await _collect(
-            _make_session(
-                "t1", channels={"values", "lifecycle"}, run_ids=("run-1",), statuses=statuses, created=created
-            )
-        )
+        first = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
         cursor = first[-1]["seq"]
-        manager.remove_broker("run-1")  # replay retention expired
+        manager.sweep_expired_logs(retention_seconds=-1)
+        await asyncio.sleep(0.002)  # a log recreated 10 min later starts in a later millisecond
         await _seed(manager, "run-2", [("values", _protocol_event("values", {"a": 2})), ("end", {"status": "success"})])
 
-        fresh = await _collect(
-            _make_session(
-                "t1", channels={"values", "lifecycle"}, run_ids=("run-1", "run-2"), statuses=statuses, created=created
-            )
-        )
-        resumed = await _collect(
-            _make_session(
-                "t1",
-                channels={"values", "lifecycle"},
-                run_ids=("run-1", "run-2"),
-                statuses=statuses,
-                created=created,
-                since=cursor,
-            )
-        )
+        fresh = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+        resumed = await _collect(_make_session("t1", channels={"values", "lifecycle"}, since=cursor))
 
         assert len(fresh) == 3
         assert fresh[0]["seq"] > cursor
         assert [(e["seq"], e["event_id"]) for e in resumed] == [(e["seq"], e["event_id"]) for e in fresh]
+
+    async def test_retried_write_is_emitted_once(self, manager: BrokerManager) -> None:
+        """A write retried after Redis applied it lands twice with the same write id."""
+        event = ("values", _protocol_event("values", {"a": 1}))
+        await manager.append("t1", "run-1", "w1", event)
+        await manager.append("t1", "run-1", "w1", event)
+        await manager.append("t1", "run-1", "w2", ("end", {"status": "success"}))
+
+        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+
+        assert [e["method"] for e in events] == ["lifecycle", "values", "lifecycle"]
 
 
 class TestInterruptsToInputChannel:
@@ -352,7 +355,7 @@ class TestInterruptsToInputChannel:
                 ("end", {"status": "interrupted"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"input", "values"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"input", "values"}))
         input_events = [e for e in events if e["method"] == "input.requested"]
         assert input_events
         assert input_events[0]["params"]["data"] == {
@@ -371,7 +374,7 @@ class TestInterruptsToInputChannel:
                 ("end", {"status": "interrupted"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"values"}))
         values_events = [e for e in events if e["method"] == "values"]
         assert "__interrupt__" not in values_events[0]["params"]["data"]
 
@@ -379,20 +382,20 @@ class TestInterruptsToInputChannel:
 class TestLifecycle:
     async def test_running_seed_opens_each_run(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("end", {"status": "success"})])
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         assert events[0]["params"]["data"] == {"event": "running"}
         assert events[0]["params"]["namespace"] == []
 
     async def test_root_lifecycle_carries_graph_name_when_known(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("end", {"status": "success"})])
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",), graph="my_graph"))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}, graph="my_graph"))
         assert events[0]["params"]["data"] == {"event": "running", "graph_name": "my_graph"}
         assert events[-1]["params"]["data"] == {"event": "completed", "graph_name": "my_graph"}
 
     async def test_root_lifecycle_event_ids_name_the_run(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("end", {"status": "success"})])
         await _seed(manager, "run-2", [("error", {"error": "RuntimeError", "message": "boom"})])
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1", "run-2")))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         assert [e["event_id"].split(":")[:2] for e in events] == [
             ["synth", "run-1"],
             ["synth", "run-1"],
@@ -402,19 +405,19 @@ class TestLifecycle:
 
     async def test_completed(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("end", {"status": "success"})])
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         assert events[-1]["params"]["data"] == {"event": "completed"}
 
     async def test_interrupted(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("end", {"status": "interrupted"})])
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         assert events[-1]["params"]["data"] == {"event": "interrupted"}
 
     async def test_failed_carries_error(self, manager: BrokerManager) -> None:
         # The real broker error event is {error, message} with NO status; the
         # failed status must come from the method, not a status key.
         await _seed(manager, "run-1", [("error", {"error": "RuntimeError", "message": "boom"})])
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         assert events[-1]["params"]["data"] == {"event": "failed", "error": "boom"}
 
 
@@ -425,7 +428,7 @@ class TestMisc:
             "run-1",
             [("custom", _protocol_event("custom", {"hello": "world"})), ("end", {"status": "success"})],
         )
-        events = await _collect(_make_session("t1", channels={"custom"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"custom"}))
         custom = [e for e in events if e["method"] == "custom"]
         assert custom and custom[0]["params"]["data"] == {"payload": {"hello": "world"}}
 
@@ -435,7 +438,7 @@ class TestMisc:
             "run-1",
             [("custom:my_event", _protocol_event("custom:my_event", {"x": 1})), ("end", {"status": "success"})],
         )
-        events = await _collect(_make_session("t1", channels={"custom:my_event"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"custom:my_event"}))
         custom = [e for e in events if e["method"] == "custom"]
         assert custom and custom[0]["params"]["data"] == {"name": "my_event", "payload": {"x": 1}}
 
@@ -450,7 +453,7 @@ class TestMisc:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"custom:my_event"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"custom:my_event"}))
         assert not [e for e in events if e["method"] == "custom"]
 
     async def test_plain_custom_subscription_receives_named_events(self, manager: BrokerManager) -> None:
@@ -459,11 +462,11 @@ class TestMisc:
             "run-1",
             [("custom:my_event", _protocol_event("custom:my_event", {"x": 1})), ("end", {"status": "success"})],
         )
-        events = await _collect(_make_session("t1", channels={"custom"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"custom"}))
         assert [e for e in events if e["method"] == "custom"]
 
-    async def test_empty_thread_closes_after_idle(self, manager: BrokerManager) -> None:
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=()))
+    async def test_empty_thread_yields_nothing(self, manager: BrokerManager) -> None:
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         assert events == []
 
 
@@ -476,8 +479,7 @@ class TestResumeAcrossRuns:
     ) -> None:
         """A resumed run may reuse its predecessor's interrupt ID.
 
-        run-a is the newest settled run (replayed compactly on connect) and
-        run-b the run in flight; each emits its own input.requested.
+        Both runs are replayed from the thread's log; each emits its own input.requested.
         """
         for run_id, question in (("run-a", "First question?"), ("run-b", "Second question?")):
             await _seed(
@@ -500,8 +502,6 @@ class TestResumeAcrossRuns:
             _make_session(
                 "t1",
                 channels={"input", "values", "lifecycle"},
-                run_ids=("run-a", "run-b"),
-                statuses={"run-a": "interrupted", "run-b": "running"},
             )
         )
 
@@ -511,9 +511,9 @@ class TestResumeAcrossRuns:
             {"question": "Second question?"},
         ]
 
-    async def test_followup_run_after_interrupt_streams_on_same_session(self, manager: BrokerManager) -> None:
+    async def test_followup_run_after_interrupt_streams_on_same_session(self, live_manager: BrokerManager) -> None:
         await _seed(
-            manager,
+            live_manager,
             "run-a",
             [
                 (
@@ -524,35 +524,21 @@ class TestResumeAcrossRuns:
             ],
         )
 
-        revealed = False
-
-        async def lister() -> list[tuple[str, str | None, str | None, datetime | None]]:
-            nonlocal revealed
-            if not revealed:
-                revealed = True
-                return [("run-a", "interrupted", None, None)]
-            return [("run-a", "interrupted", None, None), ("run-b", "running", None, None)]
-
-        async def reveal_run_b() -> None:
-            # run-b appears a beat after run-a drains, as the resume round-trip lands.
-            await asyncio.sleep(0.05)
+        async def resume_as_run_b() -> None:
+            # run-b starts a beat after run-a ended, as the resume round-trip lands.
+            await asyncio.sleep(0.1)
             await _seed(
-                manager,
+                live_manager,
                 "run-b",
-                [("values", _protocol_event("values", {"messages": [{"type": "ai", "content": "done"}]}))],
+                [
+                    ("values", _protocol_event("values", {"messages": [{"type": "ai", "content": "done"}]})),
+                    ("end", {"status": "success"}),
+                ],
             )
-            await manager.get_or_create_broker("run-b").put("run-b_end", ("end", {"status": "success"}))
 
-        session = ThreadEventSession(
-            "t1",
-            channels={"input", "values", "lifecycle"},
-            list_run_ids=lister,
-            discovery_fallback_seconds=0.05,
-            max_idle_seconds=0.5,
-        )
-        seeder = asyncio.create_task(reveal_run_b())
-        events = [e async for e in session.stream()]
-        await asyncio.wait_for(seeder, timeout=1.0)
+        seeder = asyncio.create_task(resume_as_run_b())
+        events = await _read_until_runs_end(_make_session("t1", channels={"input", "values", "lifecycle"}), 2)
+        await seeder
 
         methods = [(e["method"], e["params"]["data"]) for e in events]
         assert (
@@ -560,14 +546,7 @@ class TestResumeAcrossRuns:
             {"interrupt_id": "int-1", "value": {"q": "ok?"}, "payload": {"q": "ok?"}},
         ) in methods
         # run-b's completion proves the stream stayed open across the run gap.
-        assert any(e["method"] == "lifecycle" and e["params"]["data"] == {"event": "completed"} for e in events)
-
-    async def test_terminal_run_still_closes_after_grace(self, manager: BrokerManager) -> None:
-        """A completed run with no follow-up closes after one grace window."""
-        await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
-        session = _make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",))
-        events = await _collect(session)
-        assert [e["method"] for e in events] == ["lifecycle", "values", "lifecycle"]
+        assert events[-1]["params"]["data"] == {"event": "completed"}
 
 
 class TestNamespaceFilter:
@@ -583,7 +562,7 @@ class TestNamespaceFilter:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",), namespaces=[["sub_a"]]))
+        events = await _collect(_make_session("t1", channels={"values"}, namespaces=[["sub_a"]]))
         assert [e["params"]["data"] for e in events] == [{"a": 1}]
 
     async def test_depth_caps_nesting(self, manager: BrokerManager) -> None:
@@ -596,13 +575,13 @@ class TestNamespaceFilter:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",), depth=1))
+        events = await _collect(_make_session("t1", channels={"values"}, depth=1))
         assert [e["params"]["data"] for e in events] == [{"top": 1}]
 
     async def test_thread_level_events_always_pass_the_filter(self, manager: BrokerManager) -> None:
         """Lifecycle (empty namespace) is not subgraph-scoped; a namespace filter must not drop it."""
         await _seed(manager, "run-1", [("end", {"status": "success"})])
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",), namespaces=[["sub_a"]]))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}, namespaces=[["sub_a"]]))
         assert events[-1]["params"]["data"] == {"event": "completed"}
 
     async def test_namespace_filter_matches_dynamic_task_id_suffix(self, manager: BrokerManager) -> None:
@@ -616,7 +595,7 @@ class TestNamespaceFilter:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",), namespaces=[["sub_a"]]))
+        events = await _collect(_make_session("t1", channels={"values"}, namespaces=[["sub_a"]]))
         assert [e["params"]["data"] for e in events] == [{"a": 1}]
 
     async def test_seq_stays_absolute_under_namespace_filter(self, manager: BrokerManager) -> None:
@@ -626,13 +605,13 @@ class TestNamespaceFilter:
             "run-1",
             [
                 ("values", _protocol_event("values", {"a": 1}, namespace=["sub_b"])),  # filtered
-                ("values", _protocol_event("values", {"b": 2}, namespace=["sub_a"])),  # kept, seq=2
+                ("values", _protocol_event("values", {"b": 2}, namespace=["sub_a"])),
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",), namespaces=[["sub_a"]]))
-        # seq 1 = running seed (lifecycle channel, unsubscribed), 2 = filtered sub_b.
-        assert [(e["params"]["data"], e["seq"]) for e in events] == [({"b": 2}, 3)]
+        everything = await _collect(_make_session("t1", channels={"values"}))
+        filtered = await _collect(_make_session("t1", channels={"values"}, namespaces=[["sub_a"]]))
+        assert [(e["params"]["data"], e["seq"]) for e in filtered] == [({"b": 2}, everything[1]["seq"])]
 
 
 class TestUpdatesInterruptHandling:
@@ -652,7 +631,7 @@ class TestUpdatesInterruptHandling:
                 ("end", {"status": "interrupted"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"input", "updates"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"input", "updates"}))
         assert [e for e in events if e["method"] == "input.requested"]
         updates = [e for e in events if e["method"] == "updates"]
         assert updates and updates[0]["params"]["data"] == {"node": "worker", "values": {"count": 2}}
@@ -673,7 +652,7 @@ class TestUpdatesInterruptHandling:
                 ("end", {"status": "interrupted"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"input", "updates"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"input", "updates"}))
         input_events = [e for e in events if e["method"] == "input.requested"]
         assert input_events and input_events[0]["params"]["data"]["interrupt_id"] == "int-2"
         updates = [e for e in events if e["method"] == "updates"]
@@ -693,71 +672,56 @@ class TestUpdatesInterruptHandling:
                 ("end", {"status": "interrupted"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"input", "values"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"input", "values"}))
         input_events = [e for e in events if e["method"] == "input.requested"]
         assert len(input_events) == 1
         assert input_events[0]["params"]["data"]["interrupt_id"] == "int-3"
 
 
-class TestExpiredBrokerBackstop:
-    """A historical run whose broker events expired must not wedge the stream:
-    the persisted run status drains it instead of tailing an empty broker forever."""
+class TestRunVisibility:
+    """The first entry of a run costs one ownership-filtered lookup; hidden runs are skipped."""
 
-    async def test_terminal_run_with_empty_broker_drains_silently(self, manager: BrokerManager) -> None:
-        # run-old: success in DB, broker events long gone (empty recreated broker).
-        # run-new: live events. Without the status backstop, run-old wedges forever.
+    async def test_run_the_caller_cannot_see_is_skipped(self, manager: BrokerManager) -> None:
         await _seed(
-            manager, "run-new", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})]
+            manager, "theirs", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})]
         )
-        events = await asyncio.wait_for(
-            _collect(
-                _make_session(
-                    "t1",
-                    channels={"values", "lifecycle"},
-                    run_ids=("run-old", "run-new"),
-                    statuses={"run-old": "success", "run-new": "success"},
-                )
-            ),
-            timeout=2.0,
-        )
-        assert [e["method"] for e in events] == ["lifecycle", "values", "lifecycle"]
+        await _seed(manager, "mine", [("values", _protocol_event("values", {"a": 2})), ("end", {"status": "success"})])
 
-    async def test_terminal_run_with_lost_end_frame_gets_synthesized_terminal(self, manager: BrokerManager) -> None:
-        # Events survived but the end frame was lost — client still needs closure.
-        broker = manager.get_or_create_broker("run-old")
-        await broker.put("run-old_event_1", ("values", _protocol_event("values", {"a": 1})))
-        events = await asyncio.wait_for(
-            _collect(
-                _make_session(
-                    "t1",
-                    channels={"values", "lifecycle"},
-                    run_ids=("run-old",),
-                    statuses={"run-old": "success"},
-                )
-            ),
-            timeout=2.0,
+        events = await _collect(
+            _make_session("t1", channels={"values", "lifecycle"}, lookup_run=_lookup(hidden=("theirs",)))
         )
-        assert [(e["method"], e["params"]["data"].get("event")) for e in events] == [
-            ("lifecycle", "running"),
-            ("values", None),
-            ("lifecycle", "completed"),
-        ]
 
-    async def test_error_status_synthesizes_failed_lifecycle(self, manager: BrokerManager) -> None:
-        broker = manager.get_or_create_broker("run-old")
-        await broker.put("run-old_event_1", ("values", _protocol_event("values", {"a": 1})))
-        events = await asyncio.wait_for(
-            _collect(
-                _make_session(
-                    "t1",
-                    channels={"lifecycle"},
-                    run_ids=("run-old",),
-                    statuses={"run-old": "error"},
-                )
-            ),
-            timeout=2.0,
+        assert [e["event_id"].split(":")[:2] for e in events if e["method"] == "lifecycle"] == [["synth", "mine"]] * 2
+        assert [e["params"]["data"] for e in events if e["method"] == "values"] == [{"a": 2}]
+
+    async def test_each_run_is_looked_up_once(self, manager: BrokerManager) -> None:
+        for run_id in ("run-1", "run-2"):
+            await _seed(
+                manager,
+                run_id,
+                [
+                    ("values", _protocol_event("values", {"a": 1})),
+                    ("values", _protocol_event("values", {"a": 2})),
+                    ("end", {"status": "success"}),
+                ],
+            )
+        looked_up: list[str] = []
+
+        async def lookup(run_id: str) -> str | None:
+            looked_up.append(run_id)
+            return ""
+
+        await _collect(_make_session("t1", channels={"values"}, lookup_run=lookup))
+
+        assert looked_up == ["run-1", "run-2"]
+
+    async def test_events_after_a_runs_terminal_are_ignored(self, manager: BrokerManager) -> None:
+        """An error is terminal; the end written after it must not add a second terminal."""
+        await _seed(
+            manager, "run-1", [("error", {"error": "RuntimeError", "message": "boom"}), ("end", {"status": "error"})]
         )
-        assert events[-1]["params"]["data"]["event"] == "failed"
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
+        assert [e["params"]["data"]["event"] for e in events] == ["running", "failed"]
 
 
 class TestSubgraphLifecycle:
@@ -787,7 +751,7 @@ class TestSubgraphLifecycle:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         lc = [(e["params"]["data"].get("event"), e["params"]["namespace"]) for e in events]
         assert lc == [("running", []), ("started", ns), ("completed", ns), ("completed", [])]
         started = next(e for e in events if e["params"]["data"].get("event") == "started")
@@ -810,7 +774,7 @@ class TestSubgraphLifecycle:
                 ("error", {"error": "RuntimeError", "message": "boom"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         failed = next(e for e in events if e["params"]["data"].get("event") == "failed")
         assert failed["params"]["namespace"] == ns
         assert failed["params"]["data"]["error"] == "boom"
@@ -826,7 +790,7 @@ class TestSubgraphLifecycle:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         assert [e["params"]["data"] for e in events] == [{"event": "running"}, {"event": "completed"}]
 
     async def test_terminal_cascades_still_open_subgraph_namespaces(self, manager: BrokerManager) -> None:
@@ -844,7 +808,7 @@ class TestSubgraphLifecycle:
                 ("end", {"status": "interrupted"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
         lc = [(e["params"]["data"].get("event"), e["params"]["namespace"]) for e in events]
         assert lc == [("running", []), ("started", ns), ("completed", ns), ("interrupted", [])]
 
@@ -864,7 +828,7 @@ class TestSubgraphLifecycle:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",), namespaces=[["sub_a"]]))
+        events = await _collect(_make_session("t1", channels={"lifecycle"}, namespaces=[["sub_a"]]))
         started = [e["params"]["namespace"] for e in events if e["params"]["data"].get("event") == "started"]
         assert started == [["sub_a:1"]]
 
@@ -891,57 +855,21 @@ class TestValidateChannels:
 
 
 class TestReplayScope:
-    """FB patch P3: a connection replays the run in flight, not the thread's history."""
+    """A connection replays every run the thread's log still holds, as the LangGraph Agent Server does."""
 
-    async def test_old_settled_runs_are_not_read(self, manager: BrokerManager) -> None:
+    async def test_every_retained_run_is_replayed(self, manager: BrokerManager) -> None:
         for run_id in ("run-1", "run-2", "run-3"):
             await _seed(
                 manager, run_id, [("values", _protocol_event("values", {"r": run_id})), ("end", {"status": "success"})]
             )
-        read: list[str] = []
-        original = manager.get_or_create_broker
+        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+        assert [e["params"]["data"] for e in events if e["method"] == "values"] == [
+            {"r": "run-1"},
+            {"r": "run-2"},
+            {"r": "run-3"},
+        ]
 
-        def tracking(run_id: str) -> Any:
-            read.append(run_id)
-            return original(run_id)
-
-        manager.get_or_create_broker = tracking  # type: ignore[method-assign]
-        events = await _collect(
-            _make_session(
-                "t1",
-                channels={"values", "lifecycle"},
-                run_ids=("run-1", "run-2", "run-3"),
-                statuses={"run-1": "success", "run-2": "success", "run-3": "success"},
-            )
-        )
-        # Only the newest settled run is replayed (compactly); older ones are never touched.
-        assert read == ["run-3"]
-        assert [e["params"]["data"] for e in events if e["method"] == "values"] == [{"r": "run-3"}]
-
-    async def test_active_run_is_replayed_in_full_after_a_settled_one(self, manager: BrokerManager) -> None:
-        await _seed(manager, "run-1", [("values", _protocol_event("values", {"r": 1})), ("end", {"status": "success"})])
-        await _seed(
-            manager,
-            "run-2",
-            [
-                _msg_event("message-start", role="ai", id="m1"),
-                _msg_event("content-block-delta", index=0, delta={"type": "text-delta", "text": "hi"}),
-                ("end", {"status": "success"}),
-            ],
-        )
-        events = await _collect(
-            _make_session(
-                "t1",
-                channels={"messages", "values", "lifecycle"},
-                run_ids=("run-1", "run-2"),
-                statuses={"run-1": "success", "run-2": "running"},
-            )
-        )
-        kinds = [(e["method"], e["params"]["data"].get("event")) for e in events]
-        assert ("messages", "message-start") in kinds
-        assert ("messages", "content-block-delta") in kinds
-
-    async def test_settled_replay_drops_message_deltas(self, manager: BrokerManager) -> None:
+    async def test_message_deltas_of_settled_runs_are_replayed(self, manager: BrokerManager) -> None:
         await _seed(
             manager,
             "run-1",
@@ -951,76 +879,40 @@ class TestReplayScope:
                 ("end", {"status": "success"}),
             ],
         )
-        events = await _collect(
-            _make_session(
-                "t1", channels={"messages", "values", "lifecycle"}, run_ids=("run-1",), statuses={"run-1": "success"}
-            )
-        )
-        assert [e["method"] for e in events] == ["lifecycle", "values", "lifecycle"]
+        events = await _collect(_make_session("t1", channels={"messages", "values", "lifecycle"}))
+        assert [e["method"] for e in events] == ["lifecycle", "messages", "values", "lifecycle"]
 
-    async def test_since_past_a_run_skips_its_replay(self, manager: BrokerManager) -> None:
-        created = {"run-1": datetime(2026, 1, 1, tzinfo=UTC)}
-        await _seed(
-            manager,
-            "run-1",
-            [
-                _msg_event("message-start", role="ai", id="m1"),
-                _msg_event("message-finish"),
-                ("end", {"status": "success"}),
-            ],
-        )
-        full = await _collect(
-            _make_session("t1", channels={"messages", "lifecycle"}, run_ids=("run-1",), created=created)
-        )
-        resumed = await _collect(
-            _make_session(
-                "t1", channels={"messages", "lifecycle"}, run_ids=("run-1",), created=created, since=full[1]["seq"]
-            )
-        )
-        assert [e["event_id"] for e in resumed] == [e["event_id"] for e in full[2:]]
+    async def test_other_threads_are_not_read(self, manager: BrokerManager) -> None:
+        await _seed(manager, "run-1", [("end", {"status": "success"})], thread_id="t2")
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
+        assert events == []
 
 
 class TestStaysOpen:
-    """FB patch P3: the stream stays open and finds new runs by notice, not by polling."""
+    """The stream stays open and receives new runs from the thread's log, without polling."""
 
-    async def test_new_run_is_found_by_notice_without_a_db_poll(self, manager: BrokerManager) -> None:
-        rows: list[tuple[str, str | None, str | None, datetime | None]] = []
-        reads = 0
+    async def test_run_started_after_the_stream_opened_is_delivered(self, live_manager: BrokerManager) -> None:
+        looked_up: list[str] = []
 
-        async def lister() -> list[tuple[str, str | None, str | None, datetime | None]]:
-            nonlocal reads
-            reads += 1
-            return list(rows)
+        async def lookup(run_id: str) -> str | None:
+            looked_up.append(run_id)
+            return ""
 
-        session = ThreadEventSession(
-            "t1",
-            channels={"values", "lifecycle"},
-            list_run_ids=lister,
-            discovery_fallback_seconds=30.0,
+        session = _make_session("t1", channels={"values", "lifecycle"}, lookup_run=lookup)
+        reader = asyncio.create_task(_read_until_runs_end(session, 1))
+        await asyncio.sleep(0.2)  # several empty reads: idle costs no lookups
+        assert looked_up == []
+        await _seed(
+            live_manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})]
         )
-        received: list[dict[str, Any]] = []
 
-        async def consume() -> None:
-            async for event in session.stream():
-                received.append(event)
-                if event["method"] == "lifecycle" and event["params"]["data"].get("event") == "completed":
-                    return
+        events = await reader
 
-        task = asyncio.create_task(consume())
-        await asyncio.sleep(0.2)
-        assert reads == 1  # opened, read once, now idle without polling
-        await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
-        rows.append(("run-1", "running", None, None))
-        await manager.notify_thread("t1")
-        await asyncio.wait_for(task, timeout=2.0)
-        assert reads == 2
-        assert [e["method"] for e in received] == ["lifecycle", "values", "lifecycle"]
+        assert looked_up == ["run-1"]
+        assert [e["method"] for e in events] == ["lifecycle", "values", "lifecycle"]
 
-    async def test_idle_stream_does_not_close_by_itself(self, manager: BrokerManager) -> None:
-        session = ThreadEventSession(
-            "t1", channels={"lifecycle"}, list_run_ids=_lister(), discovery_fallback_seconds=0.05
-        )
-        stream = session.stream()
+    async def test_idle_stream_does_not_close_by_itself(self, live_manager: BrokerManager) -> None:
+        stream = _make_session("t1", channels={"lifecycle"}).stream()
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(stream.__anext__(), timeout=0.4)
         await stream.aclose()

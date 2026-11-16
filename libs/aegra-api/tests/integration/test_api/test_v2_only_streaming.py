@@ -13,7 +13,6 @@ import json
 import operator
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
-from functools import partial
 from typing import Annotated, Any, TypedDict
 from uuid import uuid4
 
@@ -32,9 +31,9 @@ from aegra_api.core import orm
 from aegra_api.core.auth_deps import get_current_user, require_auth
 from aegra_api.models.auth import User
 from aegra_api.services.event_streaming import capabilities as caps
-from aegra_api.services.event_streaming.session import ThreadEventSession
 from aegra_api.settings import settings
 from tests.fixtures.clients import create_test_app, make_client
+from tests.fixtures.streams import SessionUntilRunEnds
 
 _V2_POINTER = {
     "commands": "POST /threads/{thread_id}/commands",
@@ -125,11 +124,8 @@ def rest(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[TestClient, str]]:
     engine = create_async_engine(settings.db.database_url, poolclass=NullPool)
     monkeypatch.setattr(orm, "async_session_maker", async_sessionmaker(engine, expire_on_commit=False))
     monkeypatch.setattr(caps.settings.event_streaming, "FF_V2_EVENT_STREAMING", True)
-    monkeypatch.setattr(
-        es_module,
-        "ThreadEventSession",
-        partial(ThreadEventSession, discovery_fallback_seconds=0.05, max_idle_seconds=0.5),
-    )
+    # The thread stream never ends on its own; TestClient buffers the whole body.
+    monkeypatch.setattr(es_module, "ThreadEventSession", SessionUntilRunEnds)
 
     app = FastAPI()
     app.dependency_overrides[require_auth] = lambda: user

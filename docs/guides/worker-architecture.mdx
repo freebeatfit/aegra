@@ -20,15 +20,15 @@ flowchart TD
     Redis["Redis Job Queue"]
     Worker["Worker"]
     PG["PostgreSQL"]
-    PubSub["Redis Pub/Sub"]
+    PubSub["Redis Stream per thread"]
     Broker["SSE Broker"]
 
     Client -->|POST /runs| API
     API -->|persist + enqueue| Redis
     Redis -->|BLPOP| Worker
     Worker -->|lease + execute + finalize| PG
-    Worker -->|PUBLISH events| PubSub
-    PubSub -->|subscribe| Broker
+    Worker -->|XADD events| PubSub
+    PubSub -->|XREAD BLOCK| Broker
     Broker -->|SSE stream| Client
 
     style Client fill:#1a1a2e,stroke:#6d28d9,color:#e0e0e0
@@ -46,8 +46,8 @@ The happy path of a single run, step by step:
 2. **FastAPI** validates, persists the run to PostgreSQL (with serialized execution params), and pushes the run ID onto the Redis job queue.
 3. **Worker** picks up the job via `BLPOP` (blocking pop — instant delivery, no polling).
 4. **Worker** acquires an exclusive lease in PostgreSQL, executes the graph, heartbeats every 10s, and finalizes the run (status, output, release lease).
-5. **Worker** publishes each event to Redis Pub/Sub for real-time streaming.
-6. **SSE Broker** subscribes to Redis Pub/Sub and relays events.
+5. **Worker** appends each event to its thread's Redis Stream.
+6. **SSE Broker** reads the thread's stream with a blocking read and relays events.
 7. **Client** receives events over an SSE connection.
 
 Behind the scenes, the **Lease Reaper** scans PostgreSQL every 15 seconds for runs with expired leases (crashed workers) and re-enqueues them. Workers also send **OpenTelemetry traces** to Langfuse, Phoenix, or any OTLP collector.
@@ -124,8 +124,7 @@ sequenceDiagram
     W->>W: execute_run(job)
 
     loop For each event
-        W->>R: PUBLISH event (SSE)
-        W->>R: RPUSH event (replay buffer)
+        W->>R: XADD event (thread stream)
     end
 
     W->>PG: UPDATE status=success, output={...}
@@ -284,7 +283,7 @@ sequenceDiagram
 | Redis required | No | Yes |
 | Crash recovery | No (single process) | Yes (lease reaper) |
 | Cross-instance cancel | N/A | Yes (Redis pub/sub) |
-| SSE broker | In-memory queue + list | Redis pub/sub + replay buffer |
+| SSE broker | In-memory log per thread | Redis Stream per thread |
 | Scaling | Single instance | Horizontal (shared Redis + PostgreSQL) |
 
 <Tip>
@@ -296,9 +295,7 @@ sequenceDiagram
 | Key | Purpose | Written by | Read by |
 |:----|:--------|:-----------|:--------|
 | `aegra:jobs` | Job queue (BLPOP) | API (RPUSH) | Worker (BLPOP) |
-| `aegra:run:{run_id}` | SSE live events | Worker (PUBLISH) | API (SUBSCRIBE) |
-| `aegra:run:cache:{run_id}` | SSE replay buffer | Worker (RPUSH) | API (LRANGE) |
-| `aegra:run:counter:{run_id}` | Event sequence counter | Worker (INCR) | API (GET) |
+| `aegra:run:thread:{<thread_id>}:events` | Events of every run on the thread (TTL 10 min after the last write) | Worker (XADD) | API (XREAD BLOCK) |
 | `aegra:run:cancel` | Cancel commands | API (PUBLISH) | Worker (SUBSCRIBE) |
 | `aegra:run:done:{run_id}` | Completion signal (TTL 1h) | Worker (SET) | API (EXISTS) |
 
@@ -338,8 +335,8 @@ All worker settings are configured via environment variables. See the [environme
 | `services/run_preparation.py` | Run creation (validate, persist, submit) |
 | `services/lease_reaper.py` | Background task recovering crashed worker runs |
 | `services/broker.py` | In-memory broker + factory |
-| `services/redis_broker.py` | Redis pub/sub broker for SSE |
-| `services/streaming_service.py` | SSE orchestration (replay + live) |
+| `services/redis_broker.py` | Redis broker: per-thread event streams, cancel pub/sub |
+| `services/streaming_service.py` | Writes run events and terminal signals |
 | `models/run_job.py` | `RunJob` Pydantic model (serialized execution params) |
 | `core/orm.py` | Run table with `execution_params`, `claimed_by`, `lease_expires_at` |
 | `core/active_runs.py` | In-memory task registry (dev mode only) |

@@ -1,4 +1,4 @@
-"""Publishes run events and run signals to the per-run broker."""
+"""Publishes run events and run signals to the run's thread event log."""
 
 from typing import Any
 
@@ -10,53 +10,40 @@ logger = structlog.getLogger(__name__)
 
 
 class StreamingService:
-    """Writes a run's events and terminal signals to its broker.
+    """Writes a run's events and terminal signals to its thread's event log.
 
-    The broker handles both live broadcast and replay storage; the Agent
-    Protocol v2 thread stream (``ThreadEventSession``) reads it.
+    The Agent Protocol v2 thread stream (``ThreadEventSession``) reads that log.
     """
 
-    async def put_to_broker(
-        self,
-        run_id: str,
-        event_id: str,
-        raw_event: Any,
+    async def put_to_broker(self, run_id: str, thread_id: str, raw_event: Any) -> None:
+        """Append one ``(method, event)`` pair of the run to its thread's log."""
+        await broker_manager.get_or_create_broker(run_id, thread_id).put(raw_event)
+
+    async def signal_run_cancelled(self, run_id: str, thread_id: str) -> None:
+        """End the run's stream as interrupted, unless it already ended (any instance may call this)."""
+        broker = broker_manager.get_or_create_broker(run_id, thread_id)
+        if broker.is_finished():
+            return
+        await broker.put(("end", {"status": "interrupted"}))
+        broker_manager.cleanup_broker(run_id)
+
+    async def signal_run_error(
+        self, run_id: str, thread_id: str, error_message: str, error_type: str = "Error"
     ) -> None:
-        """Put an event into the run's broker for live consumers and replay storage."""
-        broker = broker_manager.get_or_create_broker(run_id)
-        await broker.put(event_id, raw_event)
-
-    async def signal_run_cancelled(self, run_id: str) -> None:
-        """Signal that a run was cancelled.
-
-        Uses get_or_create_broker so this works cross-instance: any instance
-        can signal cancellation since the broker is backed by Redis.
-        """
-        broker = broker_manager.get_or_create_broker(run_id)
+        """Send an ``error`` event followed by an ``end`` event, unless the run already ended."""
+        broker = broker_manager.get_or_create_broker(run_id, thread_id)
         if broker.is_finished():
             return
-
-        event_id = await broker_manager.allocate_event_id(run_id)
-        await broker.put(event_id, ("end", {"status": "interrupted"}))
+        await broker.put(("error", {"error": error_type, "message": error_message}))
+        await broker.put(("end", {"status": "error"}))
         broker_manager.cleanup_broker(run_id)
 
-    async def signal_run_error(self, run_id: str, error_message: str, error_type: str = "Error") -> None:
-        """Signal that a run encountered an error.
-
-        Sends a proper 'error' event to the broker followed by an 'end' event.
-        Uses get_or_create_broker so this works cross-instance.
-        """
-        broker = broker_manager.get_or_create_broker(run_id)
-        if broker.is_finished():
+    async def signal_run_end(self, run_id: str, status: str) -> None:
+        """End the stream of a run that produced events here, so readers see its terminal."""
+        broker = broker_manager.get_broker(run_id)
+        if broker is None or broker.is_finished():
             return
-
-        error_event_id = await broker_manager.allocate_event_id(run_id)
-        error_payload = {"error": error_type, "message": error_message}
-        await broker.put(error_event_id, ("error", error_payload))
-
-        end_event_id = await broker_manager.allocate_event_id(run_id)
-        await broker.put(end_event_id, ("end", {"status": "error"}))
-        broker_manager.cleanup_broker(run_id)
+        await broker.put(("end", {"status": status}))
 
     async def interrupt_run(self, run_id: str, *, emit_end_event: bool = True) -> bool:
         """Interrupt a running execution.

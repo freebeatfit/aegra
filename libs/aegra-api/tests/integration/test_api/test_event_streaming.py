@@ -7,7 +7,6 @@ import json
 import threading
 import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping, MutableMapping
-from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -29,18 +28,17 @@ from aegra_api.models.runs import RunCreate
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming import capabilities as caps
 from aegra_api.services.event_streaming import commands as cmd_module
-from aegra_api.services.event_streaming.session import ThreadEventSession
+from tests.fixtures.streams import drive_sse
 
 _USER = "test-user"
 
 
 class _Session:
-    """Test session: scalar() returns the thread's owner id, execute() lists runs.
+    """Test session: scalar() returns the thread's owner id, execute() looks up a run.
 
     ``owner`` is the existing thread's user_id, or None when the thread does
-    not exist yet (the run.start-creates-it path the SDK relies on). The run
-    lister selects (run_id, status) rows; status stays "running" so tests
-    exercise the live-tail path.
+    not exist yet (the run.start-creates-it path the SDK relies on). A run
+    lookup finds a run on the "test_graph" graph when ``run_ids`` is set.
     """
 
     def __init__(self, *, owner: str | None, run_ids: list[str] | None = None) -> None:
@@ -57,11 +55,11 @@ class _Session:
         return self._owner
 
     async def execute(self, _stmt: Any) -> Any:
-        rows = [(run_id, "running", "test_graph", None) for run_id in self._run_ids]
+        row = ("test_graph",) if self._run_ids else None
 
         class _Result:
-            def all(self) -> list[tuple[str, str, str, None]]:
-                return rows
+            def first(self) -> tuple[str] | None:
+                return row
 
         return _Result()
 
@@ -319,34 +317,28 @@ class TestStreamRoute:
         resp = client.post("/threads/t1/stream/events", json={"channels": ["messages"]})
         assert resp.status_code == 404
 
-    def test_stream_emits_v2_frames(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_stream_emits_v2_frames(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A run on the thread streams content-block frames over SSE."""
+        thread_id = f"t-{uuid.uuid4().hex[:8]}"
         run_id = f"run-{uuid.uuid4().hex[:8]}"
 
         def _msg(event_kind: str, **extra: Any) -> tuple[str, dict[str, Any]]:
             data = {"event": event_kind, **extra}
             return ("messages", {"type": "event", "method": "messages", "params": {"namespace": [], "data": data}})
 
-        async def seed() -> None:
-            broker = broker_manager.get_or_create_broker(run_id)
-            await broker.put(f"{run_id}_event_1", _msg("message-start", role="ai", id="m1"))
-            await broker.put(
-                f"{run_id}_event_2", _msg("content-block-delta", index=0, delta={"type": "text-delta", "text": "hi"})
-            )
-            await broker.put(f"{run_id}_event_3", _msg("message-finish"))
-            await broker.put(f"{run_id}_event_4", ("end", {"status": "success"}))
+        broker = broker_manager.get_or_create_broker(run_id, thread_id)
+        await broker.put(_msg("message-start", role="ai", id="m1"))
+        await broker.put(_msg("content-block-delta", index=0, delta={"type": "text-delta", "text": "hi"}))
+        await broker.put(_msg("message-finish"))
+        await broker.put(("end", {"status": "success"}))
+        monkeypatch.setattr(es_module, "_get_session_maker", lambda: lambda: _Session(owner=_USER, run_ids=[run_id]))
 
-        asyncio.run(seed())
-        monkeypatch.setattr(
-            es_module,
-            "ThreadEventSession",
-            partial(ThreadEventSession, discovery_fallback_seconds=0.01, max_idle_seconds=0.01),
+        response = await es_module.stream_thread_events(
+            thread_id,
+            EventStreamRequest(channels=["messages", "lifecycle"], namespaces=None, depth=None, since=None),
+            User(identity=_USER),
         )
-        client = TestClient(_make_app(monkeypatch, run_ids=[run_id]))
-
-        with client.stream("POST", "/threads/t1/stream/events", json={"channels": ["messages", "lifecycle"]}) as resp:
-            assert resp.status_code == 200
-            body = "".join(resp.iter_text())
+        body = (await drive_sse(response, stop=lambda b: b'"completed"' in b, timeout=5)).decode()
 
         assert "event: messages" in body
         assert "message-start" in body
@@ -355,45 +347,30 @@ class TestStreamRoute:
         assert "completed" in body
 
     async def test_stream_emits_dual_sdk_interrupt_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        thread_id = f"t-{uuid.uuid4().hex[:8]}"
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         interrupt_value = {"question": "Approve?"}
+        broker = broker_manager.get_or_create_broker(run_id, thread_id)
+        event = {
+            "type": "event",
+            "method": "updates",
+            "params": {
+                "namespace": [],
+                "data": {"__interrupt__": [{"id": "int-1", "value": interrupt_value}]},
+            },
+        }
+        await broker.put(("updates", event))
+        await broker.put(("end", {"status": "interrupted"}))
+        monkeypatch.setattr(es_module, "_get_session_maker", lambda: lambda: _Session(owner=_USER, run_ids=[run_id]))
 
-        async def seed() -> None:
-            broker = broker_manager.get_or_create_broker(run_id)
-            event = {
-                "type": "event",
-                "method": "updates",
-                "params": {
-                    "namespace": [],
-                    "data": {"__interrupt__": [{"id": "int-1", "value": interrupt_value}]},
-                },
-            }
-            await broker.put(f"{run_id}_event_1", ("updates", event))
-            await broker.put(f"{run_id}_event_2", ("end", {"status": "interrupted"}))
-
-        await seed()
-        monkeypatch.setattr(
-            es_module,
-            "ThreadEventSession",
-            partial(ThreadEventSession, discovery_fallback_seconds=0.01, max_idle_seconds=0.01),
-        )
-        monkeypatch.setattr(
-            es_module,
-            "_get_session_maker",
-            lambda: lambda: _Session(owner=_USER, run_ids=[run_id]),
-        )
         response = await es_module.stream_thread_events(
-            "t1",
+            thread_id,
             EventStreamRequest(channels=["input"], namespaces=None, depth=None, since=None),
             User(identity=_USER),
         )
-        chunks: list[str] = []
-        async for chunk in response.body_iterator:
-            assert isinstance(chunk, (bytes, str))
-            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
-        body = "".join(chunks)
+        body = (await drive_sse(response, stop=lambda b: b"input.requested" in b, timeout=5)).decode()
 
-        input_frame = next(frame for frame in body.split("\n\n") if frame.startswith("event: input.requested"))
+        input_frame = next(frame for frame in body.split("\n\n") if "event: input.requested" in frame)
         data_line = next(line for line in input_frame.splitlines() if line.startswith("data: "))
         envelope = json.loads(data_line.removeprefix("data: "))
         assert envelope["params"]["data"] == {
@@ -402,8 +379,8 @@ class TestStreamRoute:
             "payload": interrupt_value,
         }
 
-    async def test_lister_session_close_survives_sse_cancel(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Disconnect during a lister poll must still run session ``__aexit__``."""
+    async def test_run_lookup_session_close_survives_sse_cancel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Disconnect during a run lookup must still run session ``__aexit__``."""
         poll_started = threading.Event()
         closed = threading.Event()
         # Set and awaited on the server loop, so it fires before cancel_on_finish cancels the stream.
@@ -423,15 +400,12 @@ class TestStreamRoute:
                     state["aexit_cancelled"] = True
                     raise
                 state["aexits"] += 1
-                # Ownership check closes first; the second close is the in-stream poll.
+                # Ownership check closes first; the second close is the in-stream run lookup.
                 if state["aexits"] >= 2:
                     closed.set()
 
-        monkeypatch.setattr(
-            es_module,
-            "ThreadEventSession",
-            partial(ThreadEventSession, max_idle_seconds=5),
-        )
+        thread_id = f"t-{uuid.uuid4().hex[:8]}"
+        await broker_manager.append(thread_id, "run-1", "w1", ("end", {"status": "success"}))
         make_sse_response = es_module.make_sse_response
 
         async def on_disconnect(_message: MutableMapping[str, Any]) -> None:
@@ -444,7 +418,9 @@ class TestStreamRoute:
 
         monkeypatch.setattr(es_module, "make_sse_response", make_sse_response_with_close_handler)
         app = _make_app(monkeypatch)
-        monkeypatch.setattr(es_module, "_get_session_maker", lambda: lambda: _SlowSession(owner=_USER))
+        monkeypatch.setattr(
+            es_module, "_get_session_maker", lambda: lambda: _SlowSession(owner=_USER, run_ids=["run-1"])
+        )
         # Separate loop: uvicorn.serve() cancels every task on its running loop. asyncio.run
         # also cancels leftovers such as sse-starlette's shutdown watcher before closing it.
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error", lifespan="off"))
@@ -462,20 +438,20 @@ class TestStreamRoute:
                 httpx.AsyncClient(timeout=None) as client,
                 client.stream(
                     "POST",
-                    f"http://127.0.0.1:{port}/threads/t1/stream/events",
+                    f"http://127.0.0.1:{port}/threads/{thread_id}/stream/events",
                     json={"channels": ["messages"]},
                 ) as resp,
             ):
                 assert resp.status_code == 200
                 if not await asyncio.to_thread(poll_started.wait, 1.5):
-                    raise TimeoutError("lister poll did not start")
+                    raise TimeoutError("run lookup did not start")
                 await resp.aclose()
             if not await asyncio.to_thread(closed.wait, 1.5):
-                raise TimeoutError("lister session was not closed")
+                raise TimeoutError("run lookup session was not closed")
         finally:
             server.should_exit = True
             thread.join(timeout=3)
-            # A hung shutdown fails the test: a generator stuck in shielded polls looks like this.
+            # A hung shutdown fails the test: a generator stuck in a shielded lookup looks like this.
             if thread.is_alive():
                 raise TimeoutError("uvicorn did not shut down")
 

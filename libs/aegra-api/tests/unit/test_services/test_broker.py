@@ -1,301 +1,168 @@
-"""Unit tests for RunBroker and BrokerManager"""
+"""Unit tests for the in-memory broker: per-thread logs, run writers, cancel."""
 
 import asyncio
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aegra_api.services.base_broker import REPLAY_RETENTION_SECONDS
-from aegra_api.services.broker import BrokerManager, RunBroker
+from aegra_api.services import broker as broker_module
+from aegra_api.services.base_broker import REPLAY_RETENTION_SECONDS, entry_key
+from aegra_api.services.broker import BrokerManager
 
 
 class TestRunBroker:
-    """Test RunBroker class"""
+    @pytest.mark.asyncio
+    async def test_put_appends_to_its_threads_log(self) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+
+        await broker.put(("values", {"a": 1}))
+
+        [(entry_id, run_id, _write_id, event)] = await manager.read_thread("t1", "0-0")
+        assert (run_id, event) == ("run-1", ("values", {"a": 1}))
+        assert entry_key(entry_id) > (0, 0)
 
     @pytest.mark.asyncio
-    async def test_run_broker_initialization(self):
-        """Test RunBroker initialization"""
-        broker = RunBroker("run-123")
+    async def test_end_event_marks_finished_and_later_events_are_dropped(self) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
 
-        assert broker.run_id == "run-123"
-        assert broker._subscribers == set()
-        assert not broker.finished.is_set()
+        await broker.put(("end", {"status": "success"}))
+        await broker.put(("values", {"late": True}))
+
+        assert broker.is_finished()
+        assert [event for *_rest, event in await manager.read_thread("t1", "0-0")] == [("end", {"status": "success"})]
+
+
+class TestThreadLog:
+    @pytest.mark.asyncio
+    async def test_entry_ids_rise_with_every_write_across_runs(self) -> None:
+        manager = BrokerManager()
+        for i in range(5):
+            await manager.append("t1", f"run-{i % 2}", f"w{i}", ("updates", {"i": i}))
+
+        entries = await manager.read_thread("t1", "0-0")
+
+        keys = [entry_key(entry_id) for entry_id, *_ in entries]
+        assert keys == sorted(set(keys))
+        assert [run_id for _, run_id, _, _ in entries] == ["run-0", "run-1", "run-0", "run-1", "run-0"]
 
     @pytest.mark.asyncio
-    async def test_put_event(self):
-        """Test putting an event into broker"""
-        broker = RunBroker("run-123")
+    async def test_read_returns_only_entries_after_the_cursor(self) -> None:
+        manager = BrokerManager()
+        for i in range(3):
+            await manager.append("t1", "run-1", f"w{i}", ("updates", {"i": i}))
+        first, *_ = await manager.read_thread("t1", "0-0")
 
-        await broker.put("evt-1", {"data": "test"})
+        rest = await manager.read_thread("t1", first[0])
 
-        # Event is buffered for replay and delivered to a subscriber's aiter.
-        replayed = await broker.replay(None)
-        assert replayed == [("evt-1", {"data": "test"})]
-
-    @pytest.mark.asyncio
-    async def test_put_end_event_marks_finished(self):
-        """Test that end event marks broker as finished"""
-        broker = RunBroker("run-123")
-
-        # Put end event (format: tuple with 'end' as first element)
-        await broker.put("evt-end", ("end", {}))
-
-        # Broker should be marked as finished
-        assert broker.finished.is_set()
+        assert [event for *_rest, event in rest] == [("updates", {"i": 1}), ("updates", {"i": 2})]
 
     @pytest.mark.asyncio
-    async def test_put_after_finished_warns(self):
-        """Test that putting after finished logs warning"""
-        broker = RunBroker("run-123")
-        broker.mark_finished()
+    async def test_threads_are_separate(self) -> None:
+        manager = BrokerManager()
+        await manager.append("t2", "run-1", "w1", ("end", {}))
 
-        # Should not raise, just log warning
-        await broker.put("evt-1", {"data": "test"})
-
-        # Event is dropped (broker finished) — nothing buffered.
-        assert await broker.replay(None) == []
+        with patch.object(broker_module, "_READ_WAIT_SECONDS", 0.01):
+            assert await manager.read_thread("t1", "0-0") == []
 
     @pytest.mark.asyncio
-    async def test_mark_finished(self):
-        """Test marking broker as finished"""
-        broker = RunBroker("run-123")
+    async def test_blocked_read_returns_when_a_write_lands(self) -> None:
+        manager = BrokerManager()
+        reader = asyncio.create_task(manager.read_thread("t1", "0-0"))
+        await asyncio.sleep(0.05)
+        assert not reader.done()
 
-        broker.mark_finished()
+        await manager.append("t1", "run-1", "w1", ("values", {"a": 1}))
 
-        assert broker.finished.is_set()
-
-    @pytest.mark.asyncio
-    async def test_aiter_yields_events(self):
-        """Test async iteration over broker events"""
-        broker = RunBroker("run-123")
-
-        # Put some events
-        await broker.put("evt-1", {"data": "first"})
-        await broker.put("evt-2", {"data": "second"})
-        await broker.put("evt-end", ("end", {}))
-
-        # Collect events
-        events = []
-        async for event_id, payload in broker.aiter():
-            events.append((event_id, payload))
-            if event_id == "evt-end":
-                break
-
-        assert len(events) == 3
-        assert events[0] == ("evt-1", {"data": "first"})
-        assert events[1] == ("evt-2", {"data": "second"})
-        assert events[2] == ("evt-end", ("end", {}))
+        entries = await asyncio.wait_for(reader, timeout=1.0)
+        assert [event for *_rest, event in entries] == [("values", {"a": 1})]
 
     @pytest.mark.asyncio
-    async def test_aiter_stops_on_end_event(self):
-        """Test that iteration stops on end event"""
-        broker = RunBroker("run-123")
-
-        await broker.put("evt-1", {"data": "test"})
-        await broker.put("evt-end", ("end", {}))
-
-        events = []
-        async for event_id, payload in broker.aiter():
-            events.append((event_id, payload))
-
-        # Should get both events including end
-        assert len(events) == 2
-
-    @pytest.mark.asyncio
-    async def test_two_concurrent_aiters_each_receive_every_live_event(self):
-        """Regression: the v2 SDK opens two SSE on one run (main + lifecycle watcher).
-
-        Both must receive every event. A single shared queue would split events
-        between the two consumers, so the watcher would miss the interrupt.
-        """
-        broker = RunBroker("run-123")
-
-        async def drain() -> list[tuple[str, object]]:
-            out: list[tuple[str, object]] = []
-            async for event_id, payload in broker.aiter():
-                out.append((event_id, payload))
-                if event_id == "evt-end":
-                    break
-            return out
-
-        a = asyncio.create_task(drain())
-        b = asyncio.create_task(drain())
-        await asyncio.sleep(0.05)  # let both register their subscriber queues
-
-        await broker.put("evt-1", {"data": "first"})
-        await broker.put("evt-2", {"data": "second"})
-        await broker.put("evt-end", ("end", {}))
-
-        got_a, got_b = await asyncio.gather(a, b)
-        assert got_a == got_b
-        assert [eid for eid, _ in got_a] == ["evt-1", "evt-2", "evt-end"]
+    async def test_idle_read_returns_empty_after_its_wait(self) -> None:
+        manager = BrokerManager()
+        with patch.object(broker_module, "_READ_WAIT_SECONDS", 0.01):
+            assert await manager.read_thread("t1", "0-0") == []
 
 
 class TestBrokerManager:
-    """Test BrokerManager class"""
-
-    @pytest.mark.asyncio
-    async def test_broker_manager_initialization(self):
-        """Test BrokerManager initialization"""
+    def test_get_or_create_broker_returns_the_same_writer(self) -> None:
         manager = BrokerManager()
 
-        assert manager._brokers == {}
+        first = manager.get_or_create_broker("run-1", "t1")
 
-    @pytest.mark.asyncio
-    async def test_get_or_create_broker(self):
-        """Test getting or creating a broker"""
+        assert manager.get_or_create_broker("run-1", "t1") is first
+        assert manager.get_broker("run-1") is first
+        assert first.thread_id == "t1"
+
+    def test_get_nonexistent_broker(self) -> None:
+        assert BrokerManager().get_broker("nonexistent") is None
+
+    def test_cleanup_broker_finishes_and_forgets_it(self) -> None:
         manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
 
-        broker1 = manager.get_or_create_broker("run-123")
-        broker2 = manager.get_or_create_broker("run-123")
+        manager.cleanup_broker("run-1")
+        manager.cleanup_broker("nonexistent")
 
-        # Should return the same broker instance
-        assert broker1 is broker2
-        assert broker1.run_id == "run-123"
-
-    @pytest.mark.asyncio
-    async def test_get_or_create_different_runs(self):
-        """Test creating brokers for different runs"""
-        manager = BrokerManager()
-
-        broker1 = manager.get_or_create_broker("run-123")
-        broker2 = manager.get_or_create_broker("run-456")
-
-        # Should be different brokers
-        assert broker1 is not broker2
-        assert broker1.run_id == "run-123"
-        assert broker2.run_id == "run-456"
-
-    @pytest.mark.asyncio
-    async def test_get_existing_broker(self):
-        """Test getting an existing broker"""
-        manager = BrokerManager()
-
-        # Create a broker
-        created = manager.get_or_create_broker("run-123")
-
-        # Get it
-        retrieved = manager.get_broker("run-123")
-
-        assert retrieved is created
-
-    @pytest.mark.asyncio
-    async def test_get_nonexistent_broker(self):
-        """Test getting a nonexistent broker returns None"""
-        manager = BrokerManager()
-
-        broker = manager.get_broker("nonexistent")
-
-        assert broker is None
-
-    @pytest.mark.asyncio
-    async def test_cleanup_broker(self):
-        """Test cleanup_broker marks broker as finished"""
-        manager = BrokerManager()
-
-        # Create a broker
-        broker = manager.get_or_create_broker("run-123")
-
-        # Cleanup it (marks finished but doesn't remove)
-        manager.cleanup_broker("run-123")
-
-        # Should still exist but be marked finished
-        assert manager.get_broker("run-123") is broker
         assert broker.is_finished()
+        assert manager.get_broker("run-1") is None
 
     @pytest.mark.asyncio
-    async def test_remove_broker(self):
-        """Test removing a broker"""
+    async def test_start_and_stop(self) -> None:
         manager = BrokerManager()
 
-        # Create a broker
-        manager.get_or_create_broker("run-123")
-
-        # Remove it
-        manager.remove_broker("run-123")
-
-        # Should no longer exist
-        assert manager.get_broker("run-123") is None
-
-    @pytest.mark.asyncio
-    async def test_remove_nonexistent_broker(self):
-        """Test removing a nonexistent broker doesn't error"""
-        manager = BrokerManager()
-
-        # Should not raise
-        manager.remove_broker("nonexistent")
-
-    @pytest.mark.asyncio
-    async def test_start_and_stop(self):
-        """Test starting and stopping broker manager"""
-        manager = BrokerManager()
-
-        # Start (creates cleanup task)
         await manager.start()
-
         assert manager._cleanup_task is not None
         assert not manager._cleanup_task.done()
 
-        # Stop (cancels cleanup task)
         await manager.stop()
-
         assert manager._cleanup_task.cancelled() or manager._cleanup_task.done()
+
+    @pytest.mark.asyncio
+    async def test_request_cancel_cancels_the_local_task_and_ends_its_stream(self) -> None:
+        manager = BrokerManager()
+        await manager.get_or_create_broker("run-1", "t1").put(("values", {"a": 1}))
+        task = MagicMock()
+        task.done.return_value = False
+
+        with patch.dict(broker_module.active_runs, {"run-1": task}, clear=True):
+            await manager.request_cancel("run-1")
+
+        task.cancel.assert_called_once()
+        broker = manager.get_broker("run-1")
+        assert broker is not None and broker.is_finished()
+        assert (await manager.read_thread("t1", "0-0"))[-1][3] == ("end", {"status": "interrupted"})
+
+    @pytest.mark.asyncio
+    async def test_request_cancel_can_leave_terminal_signaling_to_the_api(self) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        task = MagicMock()
+        task.done.return_value = False
+
+        with patch.dict(broker_module.active_runs, {"run-1": task}, clear=True):
+            await manager.request_cancel("run-1", emit_end_event=False)
+
+        task.cancel.assert_called_once()
+        assert not broker.is_finished()
 
 
 class TestReplayRetention:
-    """Finished brokers survive the replay window, then get swept."""
+    @pytest.mark.asyncio
+    async def test_log_survives_inside_the_window(self) -> None:
+        manager = BrokerManager()
+        await manager.append("t1", "run-1", "w1", ("end", {}))
+        manager._logs["t1"].last_write -= REPLAY_RETENTION_SECONDS - 60
 
-    @staticmethod
-    def _finish_at(broker: RunBroker, seconds_ago: float) -> None:
-        """Backdate the broker's completion so the sweep sees it as aged."""
-        broker.mark_finished()
-        assert broker._finished_at is not None
-        broker._finished_at -= seconds_ago
+        assert manager.sweep_expired_logs() == []
 
     @pytest.mark.asyncio
-    async def test_unfinished_broker_is_never_swept(self) -> None:
+    async def test_log_is_swept_past_the_window_after_its_last_write(self) -> None:
         manager = BrokerManager()
-        manager.get_or_create_broker("run-1")
+        await manager.append("t1", "run-1", "w1", ("end", {}))
+        manager._logs["t1"].last_write -= REPLAY_RETENTION_SECONDS + 60
 
-        assert manager.sweep_expired_brokers(retention_seconds=0) == []
-        assert manager.get_broker("run-1") is not None
-
-    @pytest.mark.asyncio
-    async def test_finished_broker_survives_inside_the_window(self) -> None:
-        manager = BrokerManager()
-        self._finish_at(manager.get_or_create_broker("run-1"), seconds_ago=REPLAY_RETENTION_SECONDS - 60)
-
-        assert manager.sweep_expired_brokers() == []
-        assert manager.get_broker("run-1") is not None
-
-    @pytest.mark.asyncio
-    async def test_finished_broker_is_swept_past_the_window(self) -> None:
-        manager = BrokerManager()
-        self._finish_at(manager.get_or_create_broker("run-1"), seconds_ago=REPLAY_RETENTION_SECONDS + 60)
-        await manager.allocate_event_id("run-1")
-
-        assert manager.sweep_expired_brokers() == ["run-1"]
-        assert manager.get_broker("run-1") is None
-        assert manager._event_counters == {}
-
-    @pytest.mark.asyncio
-    async def test_window_starts_at_completion_not_creation(self) -> None:
-        """A long run must still get a full window after it ends."""
-        manager = BrokerManager()
-        broker = manager.get_or_create_broker("run-1")
-        broker._created_at -= REPLAY_RETENTION_SECONDS * 10
-        broker.mark_finished()
-
-        assert manager.sweep_expired_brokers() == []
-
-    @pytest.mark.asyncio
-    async def test_broker_with_a_queued_event_is_kept(self) -> None:
-        """is_empty() gates the sweep so a subscriber cannot lose an undelivered event."""
-        manager = BrokerManager()
-        broker = manager.get_or_create_broker("run-1")
-        queue: asyncio.Queue = asyncio.Queue()
-        broker._subscribers.add(queue)
-        queue.put_nowait(("evt-1", {"data": "x"}))
-        self._finish_at(broker, seconds_ago=REPLAY_RETENTION_SECONDS + 60)
-
-        assert manager.sweep_expired_brokers() == []
-        assert manager.get_broker("run-1") is not None
+        assert manager.sweep_expired_logs() == ["t1"]
+        with patch.object(broker_module, "_READ_WAIT_SECONDS", 0.01):
+            assert await manager.read_thread("t1", "0-0") == []

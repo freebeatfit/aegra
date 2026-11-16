@@ -12,7 +12,6 @@ verify thread (and run) ownership before doing anything.
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from datetime import datetime
 
 import anyio
 import structlog
@@ -32,7 +31,7 @@ from aegra_api.models import User
 from aegra_api.models.event_streaming import EventStreamRequest, ThreadCommand
 from aegra_api.services.event_streaming.capabilities import get_v2_capabilities
 from aegra_api.services.event_streaming.commands import handle_command
-from aegra_api.services.event_streaming.session import RunLister, ThreadEventSession, validate_channels
+from aegra_api.services.event_streaming.session import RunLookup, ThreadEventSession, validate_channels
 
 logger = structlog.getLogger(__name__)
 
@@ -51,30 +50,28 @@ async def _verify_thread_owned_or_new(session: AsyncSession, thread_id: str, use
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
 
-def _thread_run_lister(thread_id: str, user: User) -> RunLister:
-    """Async callable returning the thread's (run_id, status, graph_name, created_at) rows (oldest first), user-scoped.
+def _thread_run_lookup(thread_id: str, user: User) -> RunLookup:
+    """Look up a run the stream sees for the first time: its graph name, or None if the caller can't see it.
 
-    Called repeatedly while a stream is live so a run started after the stream
-    opened is picked up. Status lets the session drain historical runs whose
-    broker events expired instead of tailing them forever; graph_name feeds the
-    run's root lifecycle events. Each tick uses a short-lived session so a
-    connection is not held for the whole SSE lifetime (see #423).
+    One query per new run id, like the LangGraph Agent Server's run fetch, in a
+    short-lived session so no connection is held for the SSE lifetime (#423).
     """
 
-    async def list_run_ids() -> list[tuple[str, str | None, str | None, datetime | None]]:
+    async def graph_of(run_id: str) -> str | None:
         maker = _get_session_maker()
         # sse-starlette's anyio cancel punches through asyncio.shield (#530).
         with anyio.CancelScope(shield=True):
             async with maker() as session:
-                rows = await session.execute(
-                    select(RunORM.run_id, RunORM.status, AssistantORM.graph_id, RunORM.created_at)
+                result = await session.execute(
+                    select(AssistantORM.graph_id)
+                    .select_from(RunORM)
                     .outerjoin(AssistantORM, RunORM.assistant_id == AssistantORM.assistant_id)
-                    .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
-                    .order_by(RunORM.created_at.asc())
+                    .where(RunORM.run_id == run_id, RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
                 )
-                return [(run_id, status, graph_id, created_at) for run_id, status, graph_id, created_at in rows.all()]
+                row = result.first()
+        return None if row is None else row[0] or ""
 
-    return list_run_ids
+    return graph_of
 
 
 def _require_v2_enabled() -> None:
@@ -110,10 +107,11 @@ async def stream_thread_events(
     Thread-scoped: events for any run on the thread flow through, so a
     client can open the stream then issue ``run.start``. Each SSE frame's
     ``data:`` is a protocol event envelope; ``id:`` is the ``seq`` a client
-    echoes back as ``since`` on resume.
+    echoes back as ``since`` on resume. The stream stays open until the client
+    leaves.
 
     DB work runs in short-lived sessions (the upfront ownership check here, and
-    each run-lister poll) so no connection is held for the SSE lifetime (#423).
+    one lookup per run the stream sees) so no connection is held for the SSE lifetime (#423).
     """
     _require_v2_enabled()
 
@@ -131,7 +129,7 @@ async def stream_thread_events(
     session_stream = ThreadEventSession(
         thread_id,
         channels=channels,
-        list_run_ids=_thread_run_lister(thread_id, user),
+        lookup_run=_thread_run_lookup(thread_id, user),
         since=body.since,
         namespaces=body.namespaces,
         depth=body.depth,

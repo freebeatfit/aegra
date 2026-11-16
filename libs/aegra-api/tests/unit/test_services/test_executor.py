@@ -149,6 +149,7 @@ class TestRunExecutorBoundaryConditions:
         ):
             mock_streaming.cleanup_run = AsyncMock()
             mock_streaming.signal_run_error = AsyncMock()
+            mock_streaming.signal_run_end = AsyncMock()
 
             from aegra_api.services.run_executor import execute_run
 

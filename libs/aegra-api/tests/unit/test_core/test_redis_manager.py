@@ -26,16 +26,18 @@ class TestRedisManager:
 
         with (
             patch("aegra_api.core.redis_manager.aioredis.ConnectionPool") as mock_pool_cls,
+            patch("aegra_api.core.redis_manager.aioredis.BlockingConnectionPool") as mock_stream_pool_cls,
             patch("aegra_api.core.redis_manager.aioredis.Redis", return_value=mock_client) as mock_redis_cls,
         ):
             mock_pool_cls.from_url.return_value = mock_pool
 
             await manager.initialize()
 
-            # shared pool + dedicated pool for blocking commands
+            # shared pool + dedicated pools for BLPOP and for thread stream reads
             assert mock_pool_cls.from_url.call_count == 2
-            assert mock_redis_cls.call_count == 2
-            mock_redis_cls.assert_called_with(connection_pool=mock_pool)
+            assert mock_stream_pool_cls.from_url.call_count == 1
+            assert mock_redis_cls.call_count == 3
+            mock_redis_cls.assert_called_with(connection_pool=mock_stream_pool_cls.from_url.return_value)
             mock_client.ping.assert_awaited_once()
 
         # Clean up
@@ -69,6 +71,28 @@ class TestRedisManager:
         manager._pool = None
         manager._blocking_client = None
         manager._blocking_pool = None
+
+    @pytest.mark.asyncio
+    async def test_stream_read_pool_waits_when_full_and_rereads_after_a_dropped_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One connection per open thread stream; a full pool queues instead of raising."""
+        monkeypatch.setattr(redis_manager_module.settings.redis, "REDIS_STREAM_READ_MAX_CONNECTIONS", 7)
+        monkeypatch.setattr(redis_manager_module.settings.redis, "REDIS_URL", "redis://localhost:1/0?socket_timeout=1")
+        manager = RedisManager()
+
+        with patch("aegra_api.core.redis_manager.aioredis.Redis", side_effect=lambda **_: AsyncMock()):
+            await manager.initialize()
+        pool = manager._stream_read_pool
+
+        assert isinstance(pool, aioredis.BlockingConnectionPool)
+        assert pool.max_connections == 7
+        assert pool.timeout is None  # waits for a free connection, never raises
+        conn = pool.make_connection()
+        assert conn.socket_timeout == manager.stream_read_block_ms / 1000 + 5
+        assert conn.retry.get_retries() == settings.redis.REDIS_RETRY_ATTEMPTS
+        assert RedisConnectionError in conn.retry_on_error
+        assert conn.client_name == redis_manager_module.STREAM_READ_CLIENT_NAME
 
     @pytest.mark.asyncio
     async def test_initialize_configures_retry_and_health_checks(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,6 +146,7 @@ class TestRedisManager:
 
         with (
             patch("aegra_api.core.redis_manager.aioredis.ConnectionPool.from_url", side_effect=capture_from_url),
+            patch("aegra_api.core.redis_manager.aioredis.BlockingConnectionPool"),
             patch("aegra_api.core.redis_manager.aioredis.Redis", side_effect=lambda **_: AsyncMock()),
         ):
             await manager.initialize()
@@ -215,6 +240,24 @@ class TestRedisManager:
         mock_pool.disconnect.assert_awaited_once()
         assert manager._blocking_client is None
         assert manager._blocking_pool is None
+
+    @pytest.mark.asyncio
+    async def test_close_cleans_up_stream_read_pool(self) -> None:
+        manager = RedisManager()
+        mock_client = AsyncMock()
+        mock_pool = AsyncMock()
+        manager._stream_read_client = mock_client
+        manager._stream_read_pool = mock_pool
+
+        await manager.close()
+
+        mock_client.aclose.assert_awaited_once()
+        mock_pool.disconnect.assert_awaited_once()
+        assert manager._stream_read_client is None
+
+    def test_get_stream_read_client_raises_when_not_initialized(self) -> None:
+        with pytest.raises(RuntimeError, match="Redis not initialized"):
+            RedisManager().get_stream_read_client()
 
     def test_get_blocking_client_raises_when_not_initialized(self) -> None:
         with pytest.raises(RuntimeError, match="Redis not initialized"):

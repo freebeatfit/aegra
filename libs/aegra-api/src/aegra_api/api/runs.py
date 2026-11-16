@@ -72,7 +72,7 @@ async def _request_run_interruption(
         else:
             await streaming_service.cancel_run(run_orm.run_id, emit_end_event=False)
         try:
-            await streaming_service.signal_run_cancelled(run_orm.run_id)
+            await streaming_service.signal_run_cancelled(run_orm.run_id, run_orm.thread_id)
         except (RedisError, OSError):
             # Database reconciliation has already committed. A broker outage
             # must not turn the successful interruption into an API error.

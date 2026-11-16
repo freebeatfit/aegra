@@ -1,166 +1,110 @@
-"""Abstract base classes for the broker system"""
+"""Per-thread event log and run cancellation, shared by both broker backends.
+
+Every event of every run on a thread goes to one log per thread, in producer
+order (a Redis Stream when ``REDIS_BROKER_ENABLED=true``, a list in dev mode).
+A thread stream reads the log from its cursor, the entry id, with a bounded
+blocking read, so a run started after the stream opened shows up on it.
+"""
 
 import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
-from types import TracebackType
 from typing import Any
+from uuid import uuid4
+
+import structlog
 
 from aegra_api.models.enums import RunCancellationAction
 
-# How long a finished run's events stay replayable, both backends. Reconnects
-# happen in seconds; this is the documented window in docs/guides/streaming.mdx.
+logger = structlog.getLogger(__name__)
+
+# A thread's log expires this long after its last write. Reconnects happen in
+# seconds; this is the documented window in docs/guides/streaming.mdx.
 REPLAY_RETENTION_SECONDS = 600
+# Entries kept per thread log (approximate in Redis).
+REPLAY_MAX_EVENTS = 10_000
+# Entries returned per read.
+READ_BATCH = 200
+
+# (entry_id, run_id, write_id, event). entry_id is "<ms>-<n>" and rises with
+# every write on the thread; a retried write keeps its write_id.
+ThreadEntry = tuple[str, str, str, Any]
 
 
-class BaseRunBroker(ABC):
-    """Abstract base class for a run-specific event broker.
-
-    Handles both live event broadcast and replay storage for SSE reconnection.
-    """
-
-    @abstractmethod
-    async def put(self, event_id: str, payload: Any, *, resumable: bool = True) -> None:
-        """Publish an event to live subscribers and optionally store for replay.
-
-        Args:
-            event_id: Unique event identifier (format: {run_id}_event_{seq}).
-            payload: The event data (typically a tuple like ("values", {...})).
-            resumable: If True, store the event for replay on reconnect.
-        """
-
-    @abstractmethod
-    def aiter(self) -> AsyncIterator[tuple[str, Any]]:
-        """Async iterator yielding (event_id, payload) pairs."""
-        ...
-
-    @abstractmethod
-    async def replay(self, last_event_id: str | None) -> list[tuple[str, Any]]:
-        """Return stored events for replay on reconnect.
-
-        Args:
-            last_event_id: If provided, return events after this ID.
-                           If None, return all stored events.
-
-        Returns:
-            List of (event_id, payload) tuples in order.
-        """
-
-    async def replay_iter(self, last_event_id: str | None) -> AsyncIterator[tuple[str, Any]]:
-        """Like :meth:`replay`, but may yield in batches instead of loading all at once."""
-        for item in await self.replay(last_event_id):
-            yield item
-
-    async def replay_settled(self, last_event_id: str | None, *, tail: int = 64) -> list[tuple[str, Any]]:
-        """A settled run's compact replay: its last state and how it ended.
-
-        The latest values snapshots plus the last ``tail`` stored events that
-        :func:`~aegra_api.services.replay_policy.kept_when_settled` keeps.
-        """
-        from aegra_api.services.replay_policy import kept_when_settled, snapshot_slot
-
-        replayed = await self.replay(last_event_id)
-        kept = [item for item in replayed if snapshot_slot(item[1]) is not None or kept_when_settled(item[1])]
-        snapshots = [item for item in kept if snapshot_slot(item[1]) is not None]
-        rest = [item for item in kept if snapshot_slot(item[1]) is None][-tail:]
-        from aegra_api.services.replay_policy import merge_replay
-
-        return merge_replay(snapshots, rest)
-
-    @abstractmethod
-    def mark_finished(self) -> None:
-        """Mark this broker as finished."""
-
-    @abstractmethod
-    def is_finished(self) -> bool:
-        """Check if this broker is finished."""
+def is_end_event(event: Any) -> bool:
+    return isinstance(event, (tuple, list)) and len(event) >= 1 and event[0] == "end"
 
 
-class ThreadWaiter:
-    """Wakes a thread stream when a run is created on its thread.
+def entry_key(entry_id: str) -> tuple[int, int]:
+    """Sort key of a ``<ms>-<n>`` entry id."""
+    ms, _, n = entry_id.partition("-")
+    return int(ms), int(n or 0)
 
-    Register before reading the thread's runs, ``clear()`` before each read and
-    ``wait()`` after it: a notification that lands in between stays set, so
-    no new run is missed.
-    """
 
-    def __init__(self, manager: "BaseBrokerManager", thread_id: str) -> None:
+class RunBroker:
+    """Writes one run's events to its thread's log and remembers that the run ended."""
+
+    def __init__(self, manager: "BaseBrokerManager", run_id: str, thread_id: str) -> None:
         self._manager = manager
+        self.run_id = run_id
         self.thread_id = thread_id
-        self._event = asyncio.Event()
+        self._finished = False
+        # Keeps this run's writes in order when a signal races a retrying write.
+        self._write_lock = asyncio.Lock()
 
-    def set(self) -> None:
-        self._event.set()
+    async def put(self, event: Any) -> None:
+        """Append *event* (a ``(method, payload)`` pair) unless the run already ended."""
+        if self._finished:
+            logger.warning("Dropped an event of an ended run", run_id=self.run_id)
+            return
+        if is_end_event(event):
+            self._finished = True
+        async with self._write_lock:
+            await self._manager.append(self.thread_id, self.run_id, uuid4().hex, event)
 
-    def clear(self) -> None:
-        self._event.clear()
+    def mark_finished(self) -> None:
+        self._finished = True
 
-    async def wait(self, timeout: float) -> bool:
-        """True when notified, False when *timeout* elapsed first."""
-        try:
-            await asyncio.wait_for(self._event.wait(), timeout)
-        except TimeoutError:
-            return False
-        return True
-
-    async def __aenter__(self) -> "ThreadWaiter":
-        self._manager._thread_waiters.setdefault(self.thread_id, set()).add(self)
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        waiters = self._manager._thread_waiters.get(self.thread_id)
-        if waiters is not None:
-            waiters.discard(self)
-            if not waiters:
-                self._manager._thread_waiters.pop(self.thread_id, None)
+    def is_finished(self) -> bool:
+        return self._finished
 
 
 class BaseBrokerManager(ABC):
-    """Abstract base class for managing multiple RunBroker instances"""
+    """Run writers, the thread logs they write to, and cross-instance cancel."""
 
-    @property
-    def _thread_waiters(self) -> dict[str, set[ThreadWaiter]]:
-        """thread_id -> waiters on this process, created on first use."""
-        waiters: dict[str, set[ThreadWaiter]] | None = self.__dict__.get("_thread_waiter_map")
-        if waiters is None:
-            waiters = self.__dict__["_thread_waiter_map"] = {}
-        return waiters
+    def __init__(self) -> None:
+        self._brokers: dict[str, RunBroker] = {}
 
-    def thread_waiter(self, thread_id: str) -> ThreadWaiter:
-        """A waiter woken when a run is created on *thread_id* (use as ``async with``)."""
-        return ThreadWaiter(self, thread_id)
+    def get_or_create_broker(self, run_id: str, thread_id: str) -> RunBroker:
+        broker = self._brokers.get(run_id)
+        if broker is None:
+            broker = self._brokers[run_id] = RunBroker(self, run_id, thread_id)
+        return broker
 
-    def _wake_thread(self, thread_id: str) -> None:
-        for waiter in list(self._thread_waiters.get(thread_id, ())):
-            waiter.set()
+    def get_broker(self, run_id: str) -> RunBroker | None:
+        return self._brokers.get(run_id)
 
-    async def notify_thread(self, thread_id: str) -> None:
-        """Tell the thread's stream sessions that a run was created.
-
-        Single-process default; the Redis manager broadcasts to every instance.
-        """
-        self._wake_thread(thread_id)
-
-    @abstractmethod
-    def get_or_create_broker(self, run_id: str) -> BaseRunBroker:
-        """Get or create a broker for a run"""
-
-    @abstractmethod
-    def get_broker(self, run_id: str) -> BaseRunBroker | None:
-        """Get an existing broker or None"""
-
-    @abstractmethod
     def cleanup_broker(self, run_id: str) -> None:
-        """Clean up a broker for a run"""
+        broker = self._brokers.pop(run_id, None)
+        if broker is not None:
+            broker.mark_finished()
+
+    async def end_cancelled_run(self, run_id: str) -> None:
+        """Write the interrupted end of a run cancelled on this instance, once."""
+        broker = self.get_broker(run_id)
+        if broker is not None and not broker.is_finished():
+            # Stays registered: execute_run's cancel path then sees the end and skips a second one.
+            await broker.put(("end", {"status": "interrupted"}))
 
     @abstractmethod
-    def remove_broker(self, run_id: str) -> None:
-        """Remove a broker completely"""
+    async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> None:
+        """Append one event to the thread's log. A write that keeps failing is logged, not raised."""
+
+    @abstractmethod
+    async def read_thread(self, thread_id: str, after: str) -> list[ThreadEntry]:
+        """Up to ``READ_BATCH`` entries after entry id *after*, waiting a bounded time for one.
+
+        An empty list means none arrived in time; ``"0-0"`` reads from the oldest kept entry.
+        """
 
     @abstractmethod
     async def start(self) -> None:
@@ -185,22 +129,3 @@ class BaseBrokerManager(ABC):
         instance can act on it. ``emit_end_event`` is disabled when the API
         has already reconciled the database and owns terminal signaling.
         """
-
-    @abstractmethod
-    async def get_event_sequence(self, run_id: str) -> int:
-        """Return the current (highest) event sequence number for a run.
-
-        Used by signal methods (cancel, error) to generate the next event ID
-        when they need to inject events into a run's stream.
-        """
-
-    async def allocate_event_id(self, run_id: str) -> str:
-        """Atomically allocate the next event sequence number and return event_id.
-
-        Default implementation uses get_event_sequence + 1 (not atomic).
-        Redis backend overrides with atomic INCR.
-        """
-        from aegra_api.utils import generate_event_id
-
-        counter = await self.get_event_sequence(run_id) + 1
-        return generate_event_id(run_id, counter)

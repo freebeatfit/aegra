@@ -383,7 +383,7 @@ class TestRunsEndpoints:
             user_id=run_orm.user_id,
         )
         mock_cancel.assert_awaited_once_with(run_orm.run_id, emit_end_event=False)
-        mock_signal.assert_awaited_once_with(run_orm.run_id)
+        mock_signal.assert_awaited_once_with(run_orm.run_id, run_orm.thread_id)
 
     @pytest.mark.asyncio
     async def test_reconciled_interrupt_uses_cooperative_stop(
@@ -417,7 +417,7 @@ class TestRunsEndpoints:
 
         mock_interrupt.assert_awaited_once_with(run_orm.run_id, emit_end_event=False)
         mock_cancel.assert_not_awaited()
-        mock_signal.assert_awaited_once_with(run_orm.run_id)
+        mock_signal.assert_awaited_once_with(run_orm.run_id, run_orm.thread_id)
 
     @pytest.mark.asyncio
     async def test_reconciled_interruption_survives_terminal_signal_outage(
@@ -450,7 +450,7 @@ class TestRunsEndpoints:
             await _request_run_interruption(mock_session, run_orm, "cancel")
 
         mock_cancel.assert_awaited_once_with(run_orm.run_id, emit_end_event=False)
-        mock_signal.assert_awaited_once_with(run_orm.run_id)
+        mock_signal.assert_awaited_once_with(run_orm.run_id, run_orm.thread_id)
 
     @pytest.mark.asyncio
     async def test_update_run_not_found(self, mock_user: User, mock_session: AsyncMock) -> None:

@@ -13,6 +13,9 @@ from aegra_api.settings import settings
 
 logger = structlog.get_logger(__name__)
 
+# CLIENT LIST name of the thread stream read connections.
+STREAM_READ_CLIENT_NAME = "aegra-stream-read"
+
 
 class RedisManager:
     """Manages Redis connection pool lifecycle.
@@ -21,11 +24,16 @@ class RedisManager:
     initialized during app lifespan and closed on shutdown.
     """
 
+    # XREAD BLOCK of a thread stream read; its socket timeout is 5 s longer.
+    stream_read_block_ms = 5_000
+
     def __init__(self) -> None:
         self._pool: aioredis.ConnectionPool | None = None
         self._client: aioredis.Redis | None = None
         self._blocking_pool: aioredis.ConnectionPool | None = None
         self._blocking_client: aioredis.Redis | None = None
+        self._stream_read_pool: aioredis.BlockingConnectionPool | None = None
+        self._stream_read_client: aioredis.Redis | None = None
 
     async def initialize(self) -> None:
         """Create connection pool and verify connectivity."""
@@ -64,6 +72,24 @@ class RedisManager:
         )
         self._blocking_client = aioredis.Redis(connection_pool=self._blocking_pool)
 
+        # One connection per open thread stream, as the LangGraph Agent Server does. The pool
+        # waits when exhausted instead of raising, so overload adds latency, not errors. A
+        # retried XREAD re-reads from the same cursor, so a dropped connection loses nothing.
+        self._stream_read_pool = aioredis.BlockingConnectionPool.from_url(
+            settings.redis.REDIS_URL,
+            max_connections=settings.redis.REDIS_STREAM_READ_MAX_CONNECTIONS,
+            timeout=None,
+            decode_responses=True,
+            health_check_interval=settings.redis.REDIS_HEALTH_CHECK_INTERVAL,
+            client_name=STREAM_READ_CLIENT_NAME,
+        )
+        self._stream_read_pool.connection_kwargs.update(
+            socket_timeout=self.stream_read_block_ms / 1000 + 5,
+            retry=Retry(ExponentialBackoff(cap=1.0, base=0.05), settings.redis.REDIS_RETRY_ATTEMPTS),
+            retry_on_error=[RedisConnectionError, RedisTimeoutError],
+        )
+        self._stream_read_client = aioredis.Redis(connection_pool=self._stream_read_pool)
+
         await self._client.ping()  # type: ignore[invalid-await]  # redis.asyncio stubs
         # Log only host info, not full URL which may contain credentials
         parsed = urlparse(settings.redis.REDIS_URL)
@@ -71,6 +97,12 @@ class RedisManager:
 
     async def close(self) -> None:
         """Close Redis connection pool."""
+        if self._stream_read_client:
+            await self._stream_read_client.aclose()
+            self._stream_read_client = None
+        if self._stream_read_pool:
+            await self._stream_read_pool.disconnect()
+            self._stream_read_pool = None
         if self._blocking_client:
             await self._blocking_client.aclose()
             self._blocking_client = None
@@ -96,6 +128,12 @@ class RedisManager:
         if self._blocking_client is None:
             raise RuntimeError("Redis not initialized. Set REDIS_BROKER_ENABLED=true and ensure Redis is running.")
         return self._blocking_client
+
+    def get_stream_read_client(self) -> aioredis.Redis:
+        """Return the client for thread stream reads (XREAD BLOCK), from their dedicated pool."""
+        if self._stream_read_client is None:
+            raise RuntimeError("Redis not initialized. Set REDIS_BROKER_ENABLED=true and ensure Redis is running.")
+        return self._stream_read_client
 
 
 # Global Redis manager instance
