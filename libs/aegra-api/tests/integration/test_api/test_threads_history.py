@@ -332,3 +332,42 @@ def test_post_history_session_released_before_state_history_iterates(monkeypatch
     assert resp.status_code == 200, resp.text
     assert session_closed, "session was never released"
     assert len(resp.json()) == 1
+
+
+def test_post_history_select_drops_values(client: TestClient, mock_langgraph):
+    """FB patch P6: the SDK's discovery read (select checkpoint+tasks) carries no values."""
+    thread_id = _ensure_thread(client)
+    resp = client.post(f"/threads/{thread_id}/history", json={"limit": 10, "select": ["checkpoint", "tasks"]})
+    assert resp.status_code == 200, resp.text
+    entries = resp.json()
+    assert len(entries) == 2
+    for entry in entries:
+        assert set(entry) == {"checkpoint", "tasks"}
+    assert entries[0]["checkpoint"]["checkpoint_id"] == "cp_1"
+
+
+def test_post_history_select_one_values_key(client: TestClient, mock_langgraph):
+    thread_id = _ensure_thread(client)
+    resp = client.post(f"/threads/{thread_id}/history", json={"limit": 10, "select": ["next", "values.messages"]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()[0] == {"next": ["step_b"], "values": {"messages": ["hello"]}}
+
+
+def test_post_history_rejects_unknown_select(client: TestClient, mock_langgraph):
+    thread_id = _ensure_thread(client)
+    resp = client.post(f"/threads/{thread_id}/history", json={"limit": 10, "select": ["secrets"]})
+    assert resp.status_code == 422
+
+
+def test_get_history_select_query(client: TestClient, mock_langgraph):
+    thread_id = _ensure_thread(client)
+    resp = client.get(f"/threads/{thread_id}/history?select=checkpoint&select=tasks")
+    assert resp.status_code == 200, resp.text
+    assert all(set(entry) == {"checkpoint", "tasks"} for entry in resp.json())
+
+
+def test_post_history_without_select_is_unchanged(client: TestClient, mock_langgraph):
+    thread_id = _ensure_thread(client)
+    resp = client.post(f"/threads/{thread_id}/history", json={"limit": 10})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()[0]["values"] == {"messages": ["hello"]}

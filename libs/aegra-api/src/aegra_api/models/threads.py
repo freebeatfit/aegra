@@ -1,5 +1,6 @@
 """Thread-related Pydantic models for Agent Protocol"""
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -17,6 +18,13 @@ from aegra_api.utils.status_compat import validate_thread_status
 MAX_TTL_MINUTES = 1_000_000_000
 
 MAX_THREAD_ID_LENGTH = MAX_ENTITY_ID_LENGTH
+
+# Fields of a ThreadState a history request may select (the LangGraph Agent
+# Server's ThreadStateSelectField); "values.<key>" keeps one key of the values.
+HISTORY_SELECT_FIELDS: frozenset[str] = frozenset(
+    {"values", "next", "tasks", "checkpoint", "metadata", "created_at", "parent_checkpoint", "interrupts"}
+)
+_VALUES_KEY = re.compile(r"values\.[A-Za-z0-9_-]+")
 
 
 class ThreadTTLSpec(BaseModel):
@@ -242,3 +250,20 @@ class ThreadHistoryRequest(BaseModel):
     checkpoint: dict[str, Any] | None = Field(None, description="Checkpoint for subgraph filtering")
     subgraphs: bool | None = Field(False, description="Include states from subgraphs")
     checkpoint_ns: str | None = Field(None, description="Checkpoint namespace")
+    select: list[str] | None = Field(
+        None,
+        description=(
+            "Fields of each state to return (values, next, tasks, checkpoint, metadata, created_at, "
+            "parent_checkpoint, interrupts), or values.<key> for one key of the values. Omit for all."
+        ),
+    )
+
+    @field_validator("select")
+    @classmethod
+    def validate_select(cls: type["ThreadHistoryRequest"], v: list[str] | None) -> list[str] | None:
+        if not v:
+            return None
+        invalid = [f for f in v if f not in HISTORY_SELECT_FIELDS and not _VALUES_KEY.fullmatch(f)]
+        if invalid:
+            raise ValueError(f"Unsupported select fields: {', '.join(invalid)}")
+        return v

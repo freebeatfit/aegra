@@ -729,12 +729,12 @@ async def get_thread_state_at_checkpoint_post(
     return output
 
 
-@router.post("/threads/{thread_id}/history", response_model=list[ThreadState], responses={**NOT_FOUND})
+@router.post("/threads/{thread_id}/history", response_model=None, responses={**NOT_FOUND})
 async def get_thread_history_post(
     thread_id: str,
     request: ThreadHistoryRequest,
     user: User = Depends(get_current_user),
-) -> list[ThreadState]:
+) -> list[ThreadState] | list[dict[str, Any]]:
     """Get the checkpoint history for a thread (POST variant).
 
     Returns a list of past states ordered from newest to oldest. Use `limit`
@@ -809,6 +809,8 @@ async def get_thread_history_post(
         # Convert outside the async with so the graph context is closed first
         thread_states = thread_state_service.convert_snapshots_to_thread_states(state_snapshots, thread_id)
 
+        if request.select:
+            return [_project_thread_state(state, request.select) for state in thread_states]
         return thread_states
 
     except HTTPException:
@@ -821,7 +823,21 @@ async def get_thread_history_post(
         raise HTTPException(500, f"Error retrieving thread history: {str(e)}") from e
 
 
-@router.get("/threads/{thread_id}/history", response_model=list[ThreadState], responses={**NOT_FOUND})
+def _project_thread_state(state: ThreadState, select: list[str]) -> dict[str, Any]:
+    """Keep only the selected fields of a history entry, as the LangGraph Agent Server does.
+
+    The SDK's subagent discovery asks for ``["checkpoint", "tasks"]`` on every
+    hydrate; without projection each entry carried the thread's full values.
+    """
+    dumped = state.model_dump(mode="json")
+    projected = {field: dumped[field] for field in select if field in dumped}
+    value_keys = [field.removeprefix("values.") for field in select if field.startswith("values.")]
+    if value_keys and "values" not in select and isinstance(dumped.get("values"), dict):
+        projected["values"] = {key: dumped["values"][key] for key in value_keys if key in dumped["values"]}
+    return projected
+
+
+@router.get("/threads/{thread_id}/history", response_model=None, responses={**NOT_FOUND})
 async def get_thread_history_get(
     thread_id: str,
     limit: int = Query(10, ge=1, le=1000, description="Number of states to return"),
@@ -829,8 +845,9 @@ async def get_thread_history_get(
     subgraphs: bool | None = Query(False, description="Include states from subgraphs"),
     checkpoint_ns: str | None = Query(None, description="Checkpoint namespace"),
     metadata: str | None = Query(None, description="JSON-encoded metadata filter"),
+    select: list[str] | None = Query(None, description="Fields of each state to return"),
     user: User = Depends(get_current_user),
-) -> list[ThreadState]:
+) -> list[ThreadState] | list[dict[str, Any]]:
     """Get the checkpoint history for a thread.
 
     Returns a list of past states ordered from newest to oldest. Use `limit`
@@ -851,6 +868,7 @@ async def get_thread_history_get(
         checkpoint=None,
         subgraphs=subgraphs,
         checkpoint_ns=checkpoint_ns,
+        select=select,
     )
     return await get_thread_history_post(thread_id, req, user)
 
