@@ -48,7 +48,8 @@ _BACKOFF_FACTOR = 2.0
 _PUT_MAX_ATTEMPTS = 3
 
 # One atomic write per event; the keys share the thread's hash tag (one Cluster slot). A script, not MULTI,
-# so a snapshot records its marker's id and the time trim stops at the root snapshot's marker.
+# so a snapshot records its marker's id, the time trim stops at the root snapshot's marker, and a
+# subgraph snapshot whose marker was trimmed goes with it.
 # ARGV: window ms, TTL s, run id, write id, namespace ("" for a plain event), payload.
 _WRITE_SCRIPT = f"""
 local now = redis.call('TIME')
@@ -63,6 +64,16 @@ else
   id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 'r', ARGV[3], 'w', ARGV[4], 'm', ARGV[5])
   redis.call('HSET', KEYS[2], ARGV[5], id)
   redis.call('HSET', KEYS[3], ARGV[5], ARGV[6])
+end
+local first = redis.call('XRANGE', KEYS[1], '-', '+', 'COUNT', 1)[1][1]
+local fms, fn = string.match(first, '^(%d+)-(%d+)$')
+local ids = redis.call('HGETALL', KEYS[2])
+for i = 1, #ids, 2 do
+  local ms, n = string.match(ids[i + 1], '^(%d+)-(%d+)$')
+  if ids[i] ~= '{ROOT_NAMESPACE}' and (tonumber(ms) < tonumber(fms) or (ms == fms and tonumber(n) < tonumber(fn))) then
+    redis.call('HDEL', KEYS[2], ids[i])
+    redis.call('HDEL', KEYS[3], ids[i])
+  end
 end
 for i = 1, 3 do redis.call('EXPIRE', KEYS[i], ARGV[2]) end
 return id

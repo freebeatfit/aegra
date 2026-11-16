@@ -55,6 +55,13 @@ class _ThreadLog:
             oldest = min(oldest, entry_key(root[0])[0])
         while self.entries and entry_key(self.entries[0][0])[0] < oldest:
             self.entries.popleft()
+        if self.entries:
+            first = entry_key(self.entries[0][0])
+            self.snapshots = {
+                namespace: snapshot
+                for namespace, snapshot in self.snapshots.items()
+                if namespace == ROOT_NAMESPACE or entry_key(snapshot[0]) >= first
+            }
         last_ms, last_n = self.last_key
         self.last_key = (ms, 0) if ms > last_ms else (last_ms, last_n + 1)
         entry_id = f"{self.last_key[0]}-{self.last_key[1]}"

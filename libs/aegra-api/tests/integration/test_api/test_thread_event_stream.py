@@ -603,6 +603,29 @@ async def test_retention_trims_by_time_and_expires_the_keys_after_the_last_write
 
 
 @pytest.mark.asyncio
+async def test_a_finished_subagent_snapshot_goes_once_its_marker_is_trimmed(
+    stream_server: _Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings.event_streaming, "RESUMABLE_STREAM_TTL_SECONDS", 1)
+    thread_id = str(uuid4())
+    ids_key, snapshots_key = (
+        f"{stream_server.prefix}thread:{{{thread_id}}}:{kind}" for kind in ("snapshot-ids", "snapshots")
+    )
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        await _run_to_end(stream_server, http, thread_id, "sub:x")
+        namespaces = set(stream_server.redis.hkeys(ids_key))
+        # Enough events to fill whole stream nodes behind the subagent's marker, then time past the window.
+        await _run_to_end(stream_server, http, thread_id, "tick:200:0")
+        await _run_to_end(stream_server, http, thread_id, "tick:300:5")
+        kept = (set(stream_server.redis.hkeys(ids_key)), set(stream_server.redis.hkeys(snapshots_key)))
+        fresh = await _reconnect(http, thread_id)
+
+    assert len(namespaces) == 2 and "[]" in namespaces
+    assert kept == ({"[]"}, {"[]"})
+    assert [e["params"]["namespace"] for e in fresh.events if e["method"] == "values"] == [[]]
+
+
+@pytest.mark.asyncio
 async def test_redis_holds_one_full_state_per_namespace(stream_server: _Server) -> None:
     thread_id = str(uuid4())
     async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:

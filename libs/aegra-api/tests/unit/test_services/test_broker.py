@@ -287,3 +287,18 @@ class TestReplayRetention:
 
         events = [event for *_rest, event in await manager.read_thread("t1", "0-0")]
         assert events == [(SNAPSHOT_MARKER, "[]"), ("updates", {"i": 1}), ("updates", {"i": 2})]
+
+    @pytest.mark.asyncio
+    async def test_a_subgraph_snapshot_goes_once_its_marker_is_trimmed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        clock = [1_000_000_000_000_000_000]
+        monkeypatch.setattr(broker_module.time, "time_ns", lambda: clock[0])
+        await broker.put(_event("values", {"s": 1}, ["sub:1"]))
+        clock[0] += 1_000_000_000
+        await broker.put(_event("values", {"r": 1}))
+
+        clock[0] += (RETENTION + 1) * 1_000_000_000
+        await manager.append("t1", "run-1", "w1", ("updates", {"i": 1}))
+
+        assert set(await manager.read_snapshot_ids("t1")) == {"[]"}
