@@ -1,13 +1,21 @@
 """Unit tests for the in-memory broker: per-thread logs, run writers, cancel."""
 
 import asyncio
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from aegra_api.services import broker as broker_module
-from aegra_api.services.base_broker import REPLAY_RETENTION_SECONDS, entry_key
+from aegra_api.services.base_broker import SNAPSHOT_MARKER, entry_key
 from aegra_api.services.broker import BrokerManager
+from aegra_api.settings import settings
+
+RETENTION = settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
+
+
+def _event(method: str, data: Any, namespace: list[str] | None = None, **params: Any) -> tuple[str, dict[str, Any]]:
+    return method, {"type": "event", "method": method, "params": {"namespace": namespace or [], "data": data, **params}}
 
 
 class TestRunBroker:
@@ -16,11 +24,55 @@ class TestRunBroker:
         manager = BrokerManager()
         broker = manager.get_or_create_broker("run-1", "t1")
 
-        await broker.put(("values", {"a": 1}))
+        await broker.put(("updates", {"a": 1}))
 
         [(entry_id, run_id, _write_id, event)] = await manager.read_thread("t1", "0-0")
-        assert (run_id, event) == ("run-1", ("values", {"a": 1}))
+        assert (run_id, event) == ("run-1", ("updates", {"a": 1}))
         assert entry_key(entry_id) > (0, 0)
+
+    @pytest.mark.asyncio
+    async def test_values_replace_the_namespace_snapshot_with_its_envelope_and_append_a_marker(self) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        checkpoint, values = _event("checkpoints", {"id": "c1", "step": 1}), _event("values", {"a": 1}, timestamp=7)
+
+        await broker.put(checkpoint)
+        await broker.put(values)
+        await broker.put(_event("values", {"a": 2}))
+
+        entries = await manager.read_thread("t1", "0-0")
+        assert [event for *_rest, event in entries] == [(SNAPSHOT_MARKER, "[]"), (SNAPSHOT_MARKER, "[]")]
+        assert await manager.read_snapshot_ids("t1") == {"[]": entries[1][0]}
+        snapshots = await manager.read_snapshots("t1", ["[]", '["sub"]'])
+        assert snapshots == {
+            "[]": (entries[1][0], {"run_id": "run-1", "checkpoint": None, "values": _event("values", {"a": 2})[1]})
+        }
+
+    @pytest.mark.asyncio
+    async def test_snapshot_keeps_the_envelope_written_just_before_it(self) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        checkpoint, values = _event("checkpoints", {"id": "c1"}, ["sub"]), _event("values", {"a": 1}, ["sub"])
+
+        await broker.put(checkpoint)
+        await broker.put(values)
+
+        [(entry_id, record)] = (await manager.read_snapshots("t1", ['["sub"]'])).values()
+        assert record == {"run_id": "run-1", "checkpoint": checkpoint[1], "values": values[1]}
+
+    @pytest.mark.asyncio
+    async def test_values_with_interrupts_and_unpaired_envelopes_stay_in_the_log(self) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        first, second = _event("checkpoints", {"id": "c1"}), _event("checkpoints", {"id": "c2"}, ["sub"])
+        interrupted = _event("values", {"a": 1}, interrupts=[{"id": "i1", "value": "q"}])
+
+        for event in (first, second, interrupted, ("end", {"status": "interrupted"})):
+            await broker.put(event)
+
+        entries = await manager.read_thread("t1", "0-0")
+        assert [event for *_rest, event in entries] == [first, second, interrupted, ("end", {"status": "interrupted"})]
+        assert await manager.read_snapshot_ids("t1") == {}
 
     @pytest.mark.asyncio
     async def test_end_event_marks_finished_and_later_events_are_dropped(self) -> None:
@@ -153,7 +205,7 @@ class TestReplayRetention:
     async def test_log_survives_inside_the_window(self) -> None:
         manager = BrokerManager()
         await manager.append("t1", "run-1", "w1", ("end", {}))
-        manager._logs["t1"].last_write -= REPLAY_RETENTION_SECONDS - 60
+        manager._logs["t1"].last_write -= RETENTION - 60
 
         assert manager.sweep_expired_logs() == []
 
@@ -161,8 +213,27 @@ class TestReplayRetention:
     async def test_log_is_swept_past_the_window_after_its_last_write(self) -> None:
         manager = BrokerManager()
         await manager.append("t1", "run-1", "w1", ("end", {}))
-        manager._logs["t1"].last_write -= REPLAY_RETENTION_SECONDS + 60
+        manager._logs["t1"].last_write -= RETENTION + 60
 
         assert manager.sweep_expired_logs() == ["t1"]
         with patch.object(broker_module, "_READ_WAIT_SECONDS", 0.01):
             assert await manager.read_thread("t1", "0-0") == []
+
+    @pytest.mark.asyncio
+    async def test_writes_trim_entries_older_than_the_window_but_not_from_the_root_snapshot_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        clock = [1_000_000_000_000_000_000]
+        monkeypatch.setattr(broker_module.time, "time_ns", lambda: clock[0])
+        await manager.append("t1", "run-1", "w0", ("updates", {"i": 0}))
+        clock[0] += 1_000_000_000
+        await broker.put(_event("values", {"a": 1}))
+        await manager.append("t1", "run-1", "w1", ("updates", {"i": 1}))
+
+        clock[0] += (RETENTION + 1) * 1_000_000_000
+        await manager.append("t1", "run-1", "w2", ("updates", {"i": 2}))
+
+        events = [event for *_rest, event in await manager.read_thread("t1", "0-0")]
+        assert events == [(SNAPSHOT_MARKER, "[]"), ("updates", {"i": 1}), ("updates", {"i": 2})]

@@ -9,13 +9,15 @@ import anyio
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from aegra_api.services.base_broker import READ_BATCH, REPLAY_MAX_EVENTS, REPLAY_RETENTION_SECONDS
+from aegra_api.services.base_broker import READ_BATCH, SNAPSHOT_MARKER
 from aegra_api.services.redis_broker import (
     _PUT_MAX_ATTEMPTS,
+    _WRITE_SCRIPT,
     RedisBrokerManager,
     _deserialize_payload,
     _serialize_payload,
 )
+from aegra_api.settings import settings
 
 
 class TestSerializationHelpers:
@@ -60,47 +62,57 @@ class TestSerializationHelpers:
         assert isinstance(result, tuple)
 
 
-def _pipeline(execute: AsyncMock) -> MagicMock:
-    pipe = MagicMock()
-    pipe.execute = execute
+def _scripted(script: AsyncMock) -> MagicMock:
     client = MagicMock()
-    client.pipeline.return_value = pipe
+    client.register_script.return_value = script
     return client
+
+
+_KEYS = ["aegra:run:thread:{t-1}:events", "aegra:run:thread:{t-1}:snapshot-ids", "aegra:run:thread:{t-1}:snapshots"]
 
 
 class TestAppend:
     @pytest.mark.asyncio
-    async def test_appends_to_the_threads_hash_tagged_stream_with_trim_and_expiry(self) -> None:
+    async def test_appends_with_one_script_call_on_the_threads_hash_tagged_keys(self) -> None:
         manager = RedisBrokerManager()
-        client = _pipeline(AsyncMock())
+        client = _scripted(AsyncMock())
 
         with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
             mock_rm.get_client.return_value = client
-            await manager.append("t-1", "run-1", "w1", ("values", {"a": 1}))
+            await manager.append("t-1", "run-1", "w1", ("updates", {"a": 1}))
 
-        pipe = client.pipeline.return_value
-        key = "aegra:run:thread:{t-1}:events"
-        pipe.xadd.assert_called_once_with(
-            key,
-            {"r": "run-1", "w": "w1", "e": json.dumps(["values", {"a": 1}])},
-            maxlen=REPLAY_MAX_EVENTS,
-            approximate=True,
+        window = settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
+        client.register_script.assert_called_once_with(_WRITE_SCRIPT)
+        client.register_script.return_value.assert_awaited_once_with(
+            keys=_KEYS, args=[window * 1000, window, "run-1", "w1", "", json.dumps(["updates", {"a": 1}])]
         )
-        pipe.expire.assert_called_once_with(key, REPLAY_RETENTION_SECONDS)
+
+    @pytest.mark.asyncio
+    async def test_a_snapshot_names_its_namespace_in_the_same_script_call(self) -> None:
+        manager = RedisBrokerManager()
+        client = _scripted(AsyncMock())
+
+        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
+            mock_rm.get_client.return_value = client
+            await manager.put_snapshot("t-1", "run-1", "w1", "[]", {"values": {"a": 1}})
+
+        _, kwargs = client.register_script.return_value.call_args
+        assert kwargs["keys"] == _KEYS
+        assert kwargs["args"][2:] == ["run-1", "w1", "[]", json.dumps({"values": {"a": 1}})]
 
     @pytest.mark.asyncio
     async def test_retries_a_transient_failure_with_the_same_write_id(self) -> None:
         manager = RedisBrokerManager()
-        client = _pipeline(AsyncMock(side_effect=[RedisConnectionError("blip"), None]))
+        client = _scripted(AsyncMock(side_effect=[RedisConnectionError("blip"), None]))
 
         with (
             patch("aegra_api.services.redis_broker.redis_manager") as mock_rm,
             patch("aegra_api.services.redis_broker.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
         ):
             mock_rm.get_client.return_value = client
-            await manager.append("t-1", "run-1", "w1", ("values", {"a": 1}))
+            await manager.append("t-1", "run-1", "w1", ("updates", {"a": 1}))
 
-        writes = client.pipeline.return_value.xadd.call_args_list
+        writes = client.register_script.return_value.call_args_list
         assert len(writes) == 2
         assert writes[0] == writes[1]
         mock_sleep.assert_awaited()
@@ -108,21 +120,21 @@ class TestAppend:
     @pytest.mark.asyncio
     async def test_gives_up_after_bounded_attempts_without_raising(self) -> None:
         manager = RedisBrokerManager()
-        client = _pipeline(AsyncMock(side_effect=RedisConnectionError("Redis down")))
+        client = _scripted(AsyncMock(side_effect=RedisConnectionError("Redis down")))
 
         with (
             patch("aegra_api.services.redis_broker.redis_manager") as mock_rm,
             patch("aegra_api.services.redis_broker.asyncio.sleep", new_callable=AsyncMock),
         ):
             mock_rm.get_client.return_value = client
-            await manager.append("t-1", "run-1", "w1", ("values", {"a": 1}))
+            await manager.append("t-1", "run-1", "w1", ("updates", {"a": 1}))
 
-        assert client.pipeline.return_value.execute.await_count == _PUT_MAX_ATTEMPTS
+        assert client.register_script.return_value.await_count == _PUT_MAX_ATTEMPTS
 
     @pytest.mark.asyncio
     async def test_end_event_marks_the_run_finished_even_when_its_write_fails(self) -> None:
         manager = RedisBrokerManager()
-        client = _pipeline(AsyncMock(side_effect=RedisConnectionError("down")))
+        client = _scripted(AsyncMock(side_effect=RedisConnectionError("down")))
 
         with (
             patch("aegra_api.services.redis_broker.redis_manager") as mock_rm,
@@ -143,22 +155,22 @@ class TestAppend:
 
         async def append(thread_id: str, run_id: str, write_id: str, event: Any) -> None:
             order.append(f"{event[0]}-start")
-            if event[0] == "values":
+            if event[0] == "updates":
                 await gate.wait()
             order.append(f"{event[0]}-end")
 
         manager.append = append  # type: ignore[method-assign]
         broker = manager.get_or_create_broker("run-1", "t-1")
-        first = asyncio.create_task(broker.put(("values", {})))
+        first = asyncio.create_task(broker.put(("updates", {})))
         await asyncio.sleep(0)
         second = asyncio.create_task(broker.put(("end", {})))
         await asyncio.sleep(0)
-        assert order == ["values-start"]
+        assert order == ["updates-start"]
 
         gate.set()
         await asyncio.gather(first, second)
 
-        assert order == ["values-start", "values-end", "end-start", "end-end"]
+        assert order == ["updates-start", "updates-end", "end-start", "end-end"]
 
 
 class TestReadThread:
@@ -182,6 +194,19 @@ class TestReadThread:
 
         assert result == [("5-0", "run-1", "w1", ("values", {"a": 1}))]
         client.xread.assert_awaited_once_with({key: "4-0"}, count=READ_BATCH, block=5000)
+
+    @pytest.mark.asyncio
+    async def test_a_marker_entry_reads_as_its_namespace(self) -> None:
+        manager = RedisBrokerManager()
+        key = "aegra:run:thread:{t-1}:events"
+        client = MagicMock()
+        client.xread = AsyncMock(return_value=[[key, [("5-0", {"r": "run-1", "w": "w1", "m": '["sub"]'})]]])
+
+        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
+            mock_rm.get_stream_read_client.return_value = client
+            result = await manager.read_thread("t-1", "4-0")
+
+        assert result == [("5-0", "run-1", "w1", (SNAPSHOT_MARKER, '["sub"]'))]
 
     @pytest.mark.asyncio
     async def test_block_timeout_returns_no_entries(self) -> None:

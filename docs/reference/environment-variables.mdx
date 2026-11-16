@@ -129,6 +129,7 @@ Aegra uses two connection pools: one for SQLAlchemy (metadata) and one for LangG
 | `REDIS_CHANNEL_PREFIX` | `aegra:run:` | Prefix for Redis keys and pub/sub channels |
 | `REDIS_MAX_CONNECTIONS` | `250` | Maximum Redis connection pool size |
 | `REDIS_STREAM_READ_MAX_CONNECTIONS` | `2000` | Connections for thread stream reads; each open stream holds one, and reads wait when all are in use |
+| `RESUMABLE_STREAM_TTL_SECONDS` | `120` | Each write trims a thread's events older than this (never the root's latest state snapshot or what follows it); the thread's keys expire this long after its last event. Also applies to the in-memory dev broker |
 
 ## Workers
 

@@ -29,7 +29,10 @@ import redis
 import uvicorn
 from fastapi import FastAPI
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
+from langgraph.stream.transformers import CustomTransformer
+from langgraph.types import interrupt
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -56,26 +59,75 @@ _GRAPH_ID = "thread_stream_echo"
 _BLOCK_MS = 300
 
 
-class _EchoState(TypedDict):
+class _EchoState(TypedDict, total=False):
+    items: Annotated[list[str], operator.add]
+    blob: str
+    step: int
+
+
+class _SubState(TypedDict):
     items: Annotated[list[str], operator.add]
 
 
-async def _echo(state: _EchoState) -> dict[str, list[str]]:
+# The input's last item picks the behavior: "big:<bytes>", "loop:<steps>:<blob bytes>[:<ms per step>]",
+# "sub:<x>" (a subgraph), "ask:<x>" (an interrupt), "tick:<count>:<ms apart>" (custom events), else echo.
+def _route(state: _EchoState) -> str:
+    name = state["items"][-1].split(":", 1)[0]
+    return name if name in ("sub", "ask", "tick") else "echo"
+
+
+async def _echo(state: _EchoState) -> dict[str, Any]:
     last = state["items"][-1]
     if last.startswith("big:"):
         return {"items": ["x" * int(last.removeprefix("big:"))]}
+    if last.startswith("loop:"):
+        _, _, size, *delay = last.split(":")
+        await asyncio.sleep(int(delay[0]) / 1000 if delay else 0)
+        step = state.get("step", 0) + 1
+        return {"blob": f"{step}:" + "x" * int(size), "step": step}
     return {"items": [f"echo:{last}"]}
+
+
+def _loops(state: _EchoState) -> str:
+    last = state["items"][-1]
+    return "echo" if last.startswith("loop:") and state["step"] < int(last.split(":")[1]) else END
+
+
+async def _inner(_state: _SubState) -> dict[str, list[str]]:
+    return {"items": ["inner"]}
+
+
+async def _ask(_state: _EchoState) -> dict[str, list[str]]:
+    return {"items": [interrupt("question?")]}
+
+
+async def _tick(state: _EchoState) -> dict[str, list[str]]:
+    _, count, delay = state["items"][-1].split(":")
+    write = get_stream_writer()
+    for i in range(int(count)):
+        write({"tick": i})
+        await asyncio.sleep(int(delay) / 1000)
+    return {"items": ["ticked"]}
 
 
 class _GraphService:
     """Serves one compiled graph in place of the aegra.json registry."""
 
     def __init__(self) -> None:
+        sub = StateGraph(_SubState)
+        sub.add_node("inner", _inner)
+        sub.add_edge(START, "inner")
+        sub.add_edge("inner", END)
         builder = StateGraph(_EchoState)
         builder.add_node("echo", _echo)
-        builder.add_edge(START, "echo")
-        builder.add_edge("echo", END)
-        self._graph = builder.compile(checkpointer=InMemorySaver())
+        builder.add_node("sub", sub.compile())
+        builder.add_node("ask", _ask)
+        builder.add_node("tick", _tick)
+        builder.add_conditional_edges(START, _route)
+        builder.add_conditional_edges("echo", _loops)
+        for node in ("sub", "ask", "tick"):
+            builder.add_edge(node, END)
+        self._graph = builder.compile(checkpointer=InMemorySaver(), transformers=[CustomTransformer])
 
     def list_graphs(self) -> dict[str, str]:
         return {_GRAPH_ID: "in-memory"}
@@ -92,6 +144,7 @@ class _Server:
     assistant_id: str
     broker: RedisBrokerManager
     redis: redis.Redis
+    prefix: str
     statements: list[str] = field(default_factory=list)
 
     async def start_run(self, http: httpx.AsyncClient, thread_id: str, text: str) -> str:
@@ -120,11 +173,13 @@ class _Stream:
         self.events: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] = []
         self.ended = False
+        self.bytes = 0
 
     async def read_until(self, stop: Callable[[_Stream], bool], timeout: float = 15.0) -> None:
         name = None
         async with asyncio.timeout(timeout):
             async for line in self._lines:
+                self.bytes += len(line.encode()) + 1
                 if line.startswith("event: "):
                     name = line.removeprefix("event: ")
                 elif line.startswith("data: "):
@@ -221,7 +276,7 @@ def stream_server(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatc
         else:
             raise RuntimeError("uvicorn did not start")
         port = server.servers[0].sockets[0].getsockname()[1]
-        yield _Server(f"http://127.0.0.1:{port}", port, assistant_id, broker, sync_redis, statements)
+        yield _Server(f"http://127.0.0.1:{port}", port, assistant_id, broker, sync_redis, prefix, statements)
     finally:
         server.should_exit = True
         thread.join(timeout=10)
@@ -243,6 +298,11 @@ def _root_lifecycle(stream: _Stream) -> list[tuple[str, str]]:
         for event in stream.events
         if event["method"] == "lifecycle" and not event["params"]["namespace"]
     ]
+
+
+def _entry_events(stream: _Stream) -> list[tuple[str, int]]:
+    """(event_id, seq) of every event but the running seed, whose seq depends on where a replay started."""
+    return [(e["event_id"], e["seq"]) for e in stream.events if not e["event_id"].endswith(":running:0")]
 
 
 @pytest.mark.asyncio
@@ -271,12 +331,13 @@ async def test_seq_rises_across_runs_and_is_the_same_on_every_connection(stream_
             run_ids.append(await stream_server.start_run(http, thread_id, "two"))
             await first.read_until(_runs_ended(2))
         async with _open(http, thread_id, ["values", "lifecycle"]) as second:
-            await second.read_until(_runs_ended(2))
+            await second.read_until(_runs_ended(1))
 
     seqs = [event["seq"] for event in first.events]
     assert seqs == sorted(set(seqs))
     assert [event_id.split(":")[1] for _, event_id in _root_lifecycle(first)] == [run_ids[0]] * 2 + [run_ids[1]] * 2
-    assert [(e["event_id"], e["seq"]) for e in second.events] == [(e["event_id"], e["seq"]) for e in first.events]
+    # A new connection replays the latest state on: the same events keep their event id and seq.
+    assert _entry_events(second) and set(_entry_events(second)) <= set(_entry_events(first))
 
 
 @pytest.mark.asyncio
@@ -289,7 +350,7 @@ async def test_idle_streams_query_no_database(stream_server: _Server) -> None:
     ):
         await stream_server.start_run(http, thread_id, "hi")
         await first.read_until(_runs_ended(1))
-        await second.read_until(lambda stream: len(stream.events) >= 2)
+        await second.read_until(lambda stream: stream.events[-1]["params"]["data"] == {"items": ["hi", "echo:hi"]})
         async with _open(http, thread_id, ["lifecycle"]) as third:
             await third.read_until(_runs_ended(1))
             before = len(stream_server.statements)
@@ -315,12 +376,13 @@ async def test_reader_resumes_after_client_kill_without_gap_or_duplicate(stream_
             await killed.read_until(_runs_ended(2))
             reconnected = stream_server.reader_ids()
         async with _open(http, thread_id, ["values", "lifecycle"]) as fresh:
-            await fresh.read_until(_runs_ended(2))
+            await fresh.read_until(_runs_ended(1))
 
     assert reconnected and not set(reconnected) & set(readers)
     event_ids = [event["event_id"] for event in killed.events]
     assert len(event_ids) == len(set(event_ids))
-    assert [(e["event_id"], e["seq"]) for e in killed.events] == [(e["event_id"], e["seq"]) for e in fresh.events]
+    assert [status for status, _ in _root_lifecycle(killed)] == ["running", "completed"] * 2
+    assert _entry_events(fresh) and set(_entry_events(fresh)) <= set(_entry_events(killed))
 
 
 def _read_to_eof(sock: socket.socket, timeout: float) -> bytes:
@@ -402,3 +464,176 @@ async def test_one_connection_pool_serves_reopened_and_concurrent_streams(stream
 
     assert [status for status, _ in _root_lifecycle(first)] == ["running", "completed"]
     assert [status for status, _ in _root_lifecycle(second)] == ["running", "completed"]
+
+
+# --- Latest-state replay (FB patch P2/P3, fb-super-agent#152) ---
+
+_STATE_CHANNELS = ["values", "checkpoints", "lifecycle"]
+
+
+def _wire(event: dict[str, Any]) -> tuple[Any, ...]:
+    """What a client keys on; a root terminal's timestamp is the time it was sent, so it is left out."""
+    params = event["params"]
+    timestamp = params["timestamp"] if event["method"] in ("values", "checkpoints") else None
+    return event["event_id"], event["seq"], event["method"], params["namespace"], params["data"], timestamp
+
+
+async def _run_to_end(server: _Server, http: httpx.AsyncClient, thread_id: str, text: str) -> _Stream:
+    async with _open(http, thread_id, _STATE_CHANNELS) as live:
+        run_id = await server.start_run(http, thread_id, text)
+        await live.read_until(
+            lambda stream: any(
+                is_root_terminal(e) and e["event_id"].startswith(f"synth:{run_id}:") for e in stream.events
+            )
+        )
+    return live
+
+
+async def _reconnect(http: httpx.AsyncClient, thread_id: str, channels: list[str] = _STATE_CHANNELS) -> _Stream:
+    async with _open(http, thread_id, channels) as fresh:
+        await fresh.read_until(_runs_ended(1))
+    return fresh
+
+
+def _thread_values(server: _Server) -> list[str]:
+    """Every value Redis holds for the server's threads: stream entry fields and hash fields."""
+    held: list[str] = []
+    for key in server.redis.scan_iter(f"{server.prefix}thread:*"):
+        kind = server.redis.type(key)
+        if kind == "stream":
+            held += [value for _, fields in server.redis.xrange(key) for value in fields.values()]
+        elif kind == "hash":
+            held += server.redis.hvals(key)
+    return held
+
+
+@pytest.mark.asyncio
+async def test_replay_is_each_namespace_latest_snapshot_then_the_later_deltas(stream_server: _Server) -> None:
+    thread_id = str(uuid4())
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        live = await _run_to_end(stream_server, http, thread_id, "sub:x")
+        fresh = await _reconnect(http, thread_id)
+
+    subagent = next(e["params"]["namespace"] for e in live.events if e["params"]["namespace"])
+    snapshots = [
+        i for i, e in enumerate(live.events) if e["method"] == "values" and e["params"]["namespace"] == subagent
+    ]
+    # The subagent's latest snapshot is older than the root's: replay starts at its envelope.
+    expected = live.events[snapshots[-1] - 1 :]
+    assert expected[0]["method"] == "checkpoints" and expected[0]["params"]["namespace"] == subagent
+    assert [e["method"] for e in expected[-3:]] == ["checkpoints", "values", "lifecycle"]
+    assert fresh.events[0]["event_id"].endswith(":running:0")
+    assert [_wire(e) for e in fresh.events[1:]] == [_wire(e) for e in expected]
+    assert [e["params"]["data"] for e in fresh.events if e["method"] == "values"] == [
+        {"items": ["sub:x", "inner"]},
+        {"items": ["sub:x", "sub:x", "inner"]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_marker_whose_snapshot_was_replaced_is_skipped(
+    stream_server: _Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_snapshots = stream_server.broker.read_snapshots
+
+    async def slow_read(thread_id: str, namespaces: list[str]) -> Any:
+        await asyncio.sleep(0.3)  # the run writes newer snapshots meanwhile
+        return await read_snapshots(thread_id, namespaces)
+
+    monkeypatch.setattr(stream_server.broker, "read_snapshots", slow_read)
+    thread_id = str(uuid4())
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        live = await _run_to_end(stream_server, http, thread_id, "loop:20:1000:50")
+
+    root = [e for e in live.events if not e["params"]["namespace"] and e["method"] in ("values", "checkpoints")]
+    pairs = [(root[i - 1], e) for i, e in enumerate(root) if e["method"] == "values" and i > 0]
+    assert pairs and len(pairs) == sum(e["method"] == "values" for e in root)
+    for envelope, values in pairs:
+        assert envelope["method"] == "checkpoints"
+        assert envelope["event_id"].rsplit(":", 1)[0] == values["event_id"].rsplit(":", 1)[0]
+        assert envelope["params"]["data"]["step"] == values["params"]["data"].get("step", 0)
+    steps = [values["params"]["data"].get("step", 0) for _, values in pairs]
+    assert steps == sorted(set(steps))
+    assert steps[-1] == 20
+    assert len(steps) < 21  # some markers were skipped: their snapshot had been replaced
+
+
+@pytest.mark.asyncio
+async def test_retention_keeps_the_snapshot_that_later_deltas_need(
+    stream_server: _Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings.event_streaming, "RESUMABLE_STREAM_TTL_SECONDS", 1)
+    thread_id = str(uuid4())
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        # One step streams 300 custom events over about 3 s, three times the retention window.
+        await stream_server.start_run(http, thread_id, "tick:300:10")
+        await asyncio.sleep(2.5)
+        fresh = await _reconnect(http, thread_id, ["values", "custom", "lifecycle"])
+
+    methods = [e["method"] for e in fresh.events]
+    first_tick = methods.index("custom")
+    assert "values" in methods[:first_tick]
+    assert fresh.events[methods.index("values")]["params"]["data"] == {"items": ["tick:300:10"]}
+    ticks = [e["params"]["data"]["payload"]["tick"] for e in fresh.events if e["method"] == "custom"]
+    assert ticks == list(range(300))
+
+
+@pytest.mark.asyncio
+async def test_retention_trims_by_time_and_expires_the_keys_after_the_last_write(
+    stream_server: _Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings.event_streaming, "RESUMABLE_STREAM_TTL_SECONDS", 1)
+    thread_id = str(uuid4())
+    stream_key = stream_server.broker.stream_key(thread_id)
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        await _run_to_end(stream_server, http, thread_id, "tick:250:0")
+        oldest = stream_server.redis.xrange(stream_key, count=1)[0][0]
+        await asyncio.sleep(0.6)
+        await _run_to_end(stream_server, http, thread_id, "tick:300:5")
+        keys = list(stream_server.redis.scan_iter(f"{stream_server.prefix}thread:{{{thread_id}}}:*"))
+        kept = stream_server.redis.xrange(stream_key, count=1)[0][0]
+        ttls = [stream_server.redis.pttl(key) for key in keys]
+        await asyncio.sleep(1.2)
+        left = list(stream_server.redis.scan_iter(f"{stream_server.prefix}thread:{{{thread_id}}}:*"))
+
+    assert kept != oldest  # the first run's events outlived the window and were trimmed
+    assert len(keys) == 3 and all(0 < ttl <= 1000 for ttl in ttls)
+    assert left == []
+
+
+@pytest.mark.asyncio
+async def test_redis_holds_one_full_state_per_namespace(stream_server: _Server) -> None:
+    thread_id = str(uuid4())
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        await _run_to_end(stream_server, http, thread_id, "loop:8:20000")
+        await _run_to_end(stream_server, http, thread_id, "sub:x")
+
+    held = _thread_values(stream_server)
+    assert sum("x" * 20000 in value for value in held) == 1  # the root's latest values only
+    assert sum('"inner"' in value for value in held) == 2  # the subagent's latest values, and the root's
+
+
+@pytest.mark.asyncio
+async def test_reconnect_bytes_do_not_grow_with_the_number_of_steps(stream_server: _Server) -> None:
+    sizes: dict[int, int] = {}
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        for steps in (5, 10):
+            thread_id = str(uuid4())
+            await _run_to_end(stream_server, http, thread_id, f"loop:{steps}:20000")
+            sizes[steps] = (await _reconnect(http, thread_id)).bytes
+
+    assert sizes[5] < 2 * 20000  # one state, not one per step
+    assert sizes[10] < sizes[5] * 1.1
+
+
+@pytest.mark.asyncio
+async def test_interrupt_reaches_a_client_that_reconnects(stream_server: _Server) -> None:
+    thread_id = str(uuid4())
+    async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
+        await _run_to_end(stream_server, http, thread_id, "ask:x")
+        fresh = await _reconnect(http, thread_id, ["values", "input", "lifecycle"])
+
+    requests = [e["params"]["data"] for e in fresh.events if e["method"] == "input.requested"]
+    assert [request["payload"] for request in requests] == ["question?"]
+    assert requests[0]["interrupt_id"]
+    assert [status for status, _ in _root_lifecycle(fresh)] == ["running", "interrupted"]

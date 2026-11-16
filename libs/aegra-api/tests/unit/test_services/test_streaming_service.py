@@ -25,9 +25,9 @@ def _logged(manager: BrokerManager, thread_id: str = "t1") -> list[tuple[str, An
 @pytest.mark.asyncio
 class TestStreamingService:
     async def test_put_to_broker_appends_to_the_threads_log(self, manager: BrokerManager) -> None:
-        await StreamingService().put_to_broker("run-1", "t1", ("values", {"a": 1}))
+        await StreamingService().put_to_broker("run-1", "t1", ("updates", {"a": 1}))
 
-        assert _logged(manager) == [("run-1", ("values", {"a": 1}))]
+        assert _logged(manager) == [("run-1", ("updates", {"a": 1}))]
 
     async def test_signal_run_cancelled_ends_the_run_once(self, manager: BrokerManager) -> None:
         service = StreamingService()

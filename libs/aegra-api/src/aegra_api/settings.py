@@ -486,6 +486,9 @@ class EventStreamingSettings(EnvBase):
     """
 
     FF_V2_EVENT_STREAMING: bool = True
+    # A thread's events older than this are trimmed on its next write (never the root's latest
+    # snapshot or what follows it), and its keys expire this long after its last write. Official name.
+    RESUMABLE_STREAM_TTL_SECONDS: int = Field(default=120, gt=0)
 
 
 class Settings:

@@ -5,18 +5,21 @@ the client opens the stream, issues ``run.start``, and the events of whatever
 run(s) execute on the thread flow through. Every run on the thread appends its
 native protocol events (the v3 producer wrote them) as ``(method, event)``
 pairs, plus a terminal ``("end"|"error", payload)``, to one event log per
-thread. The session reads that log, as the LangGraph Agent Server does: from
-the oldest kept entry, then with bounded blocking reads from its cursor, so a
-run started after the stream opened arrives on it with no database polling.
-It restamps seq/event_id, filters by channel, splits interrupts onto the
-``input`` channel, normalizes state message payloads, and derives each run's
-root lifecycle.
+thread; a ``values`` event without interrupts instead replaces its namespace's
+snapshot (stored with its checkpoint envelope) and appends a marker. The session
+replays, per requested namespace, the latest snapshot, then the log from the
+earliest of those snapshots' markers, then reads on with bounded blocking reads
+from its cursor, so a run started after the stream opened arrives on it with no
+database polling. A marker emits its snapshot only while the snapshot is still
+the one it marks; otherwise a newer marker follows. The session restamps
+seq/event_id, filters by channel, splits interrupts onto the ``input``
+channel, normalizes state message payloads, and derives each run's root
+lifecycle.
 
 ``seq`` numbers up from the log entry id, so it rises across runs and is the
-same on every connection. ``event_id`` is ``<entry id>:<index>`` (root
-lifecycle: ``synth:<run_id>:...``), stable across replays for client dedup.
-``since`` filters what was already seen; the replay itself always starts at
-the oldest kept entry.
+same on every connection. ``event_id`` is ``<entry id>:<index>`` (a snapshot's
+is its marker's; root lifecycle: ``synth:<run_id>:...``), stable across replays
+for client dedup. ``since`` filters what was already seen.
 
 The first entry of a run id the session has not seen costs one ownership-
 filtered run lookup; runs the caller can't see are skipped.
@@ -25,10 +28,11 @@ filtered run lookup; runs the caller can't see are skipped.
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from aegra_api.services.base_broker import entry_key
+from aegra_api.services.base_broker import SNAPSHOT_MARKER, Snapshot, ThreadEntry, entry_before, entry_key
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming.channels import is_supported_channel
 from aegra_api.services.event_streaming.normalizers import (
@@ -86,10 +90,15 @@ class ThreadEventSession:
         self._namespaces = [tuple(prefix) for prefix in namespaces] if namespaces else None
         self._depth = depth
         self._seq = 0
+        # run_id -> its graph name, or None when the caller can't see it.
+        self._graphs: dict[str, str | None] = {}
         # run_id -> its view, or None once it ended or when the caller can't see it.
         self._runs: dict[str, _RunView | None] = {}
         self._run_id = ""
         self._view = _RunView(graph="")
+        self._wants_state = bool({"values", "checkpoints"} & channels)
+        # Snapshots read but not yet emitted at their marker, by namespace key.
+        self._pending: dict[str, Snapshot] = {}
 
     async def stream(self) -> AsyncIterator[dict[str, Any]]:
         """Yield v2 envelopes for the thread's runs until the client disconnects.
@@ -97,22 +106,81 @@ class ThreadEventSession:
         Never ends on its own: an idle thread stream blocks on the log while
         the SSE layer sends heartbeats. A failed read raises.
         """
-        cursor = "0-0"
+        cursor = await self._replay_start()
+        first_read = True
         while True:
-            for entry_id, run_id, write_id, raw_event in await broker_manager.read_thread(self._thread_id, cursor):
+            entries = await broker_manager.read_thread(self._thread_id, cursor)
+            if first_read:
+                first_read = False
+                for envelope in await self._trimmed_snapshots(entries):
+                    yield envelope
+            await self._read_snapshots(entries)
+            for entry_id, run_id, write_id, raw_event in entries:
                 cursor = entry_id
                 for envelope in await self._ingest(entry_id, run_id, write_id, raw_event):
                     yield envelope
+            # A snapshot whose marker passed unmatched waits for a newer marker, not here.
+            self._pending = {ns: snap for ns, snap in self._pending.items() if entry_key(snap[0]) > entry_key(cursor)}
+
+    async def _replay_start(self) -> str:
+        """The cursor to replay from: before the earliest marker of a requested namespace's snapshot."""
+        ids = await broker_manager.read_snapshot_ids(self._thread_id)
+        wanted = [namespace for namespace in ids if self._wants_namespace(json.loads(namespace))]
+        if not wanted:
+            return "0-0"
+        if self._wants_state:
+            self._pending = await broker_manager.read_snapshots(self._thread_id, wanted)
+        return entry_before(min((ids[namespace] for namespace in wanted), key=entry_key))
+
+    async def _trimmed_snapshots(self, entries: list[ThreadEntry]) -> list[dict[str, Any]]:
+        """Snapshots whose marker the log no longer holds, oldest first, ahead of the first entry read."""
+        first = entry_key(entries[0][0]) if entries else None
+        envelopes: list[dict[str, Any]] = []
+        for namespace, (entry_id, record) in sorted(self._pending.items(), key=lambda item: entry_key(item[1][0])):
+            if first is not None and entry_key(entry_id) >= first:
+                continue
+            del self._pending[namespace]
+            run_id = record.get("run_id")
+            if not isinstance(run_id, str) or await self._graph(run_id) is None:
+                continue
+            ms, n = entry_key(entry_id)
+            # Past the running seed's slot, as at the marker.
+            self._seq = max(self._seq, ((ms << _SEQ_N_BITS) + n) << _SEQ_SLOT_BITS) + 1
+            envelopes += self._snapshot(entry_id, record)
+        return envelopes
+
+    async def _read_snapshots(self, entries: list[ThreadEntry]) -> None:
+        """Read the snapshot of each wanted namespace's last marker in *entries*, unless already read."""
+        if not self._wants_state:
+            return
+        latest: dict[str, str] = {}
+        for entry_id, _, _, raw_event in entries:
+            namespace = _marker_namespace(raw_event)
+            if namespace is not None and self._wants_namespace(json.loads(namespace)):
+                latest[namespace] = entry_id
+        stale = [
+            namespace
+            for namespace, entry_id in latest.items()
+            if namespace not in self._pending or entry_key(self._pending[namespace][0]) < entry_key(entry_id)
+        ]
+        if stale:
+            self._pending.update(await broker_manager.read_snapshots(self._thread_id, stale))
+
+    async def _graph(self, run_id: str) -> str | None:
+        if run_id not in self._graphs:
+            self._graphs[run_id] = await self._lookup_run(run_id)
+        return self._graphs[run_id]
 
     async def _ingest(self, entry_id: str, run_id: str, write_id: str, raw_event: Any) -> list[dict[str, Any]]:
         """Project one log entry; the first entry of a run also opens its root lifecycle."""
         first = run_id not in self._runs
         if first:
-            graph = await self._lookup_run(run_id)
+            graph = await self._graph(run_id)
             self._runs[run_id] = None if graph is None else _RunView(graph=graph)
         view = self._runs[run_id]
-        # A retried write lands twice with the same write id.
-        if view is None or write_id == view.last_write:
+        marker = _marker_namespace(raw_event)
+        # A retried write lands twice with the same write id; a retried marker can match only once.
+        if view is None or (marker is None and write_id == view.last_write):
             return []
         view.last_write = write_id
         self._run_id, self._view = run_id, view
@@ -125,13 +193,29 @@ class ThreadEventSession:
         else:
             # The running seed's slot, so an entry's seqs don't depend on where the replay started.
             self._seq += 1
+        if marker is not None:
+            snapshot = self._pending.get(marker)
+            if snapshot is not None and snapshot[0] == entry_id:
+                del self._pending[marker]
+                envelopes += self._snapshot(entry_id, snapshot[1])
+            return envelopes
         envelopes += self._project(entry_id, raw_event)
         if _is_terminal(raw_event):
             # The run ended: drop its state and ignore anything it writes after.
             self._runs[run_id] = None
         return envelopes
 
-    def _project(self, event_id: str, raw_event: Any) -> list[dict[str, Any]]:
+    def _snapshot(self, entry_id: str, record: dict[str, Any]) -> list[dict[str, Any]]:
+        """A snapshot's checkpoint envelope then its values, with their producer timestamps."""
+        checkpoint = record.get("checkpoint")
+        if checkpoint is None:
+            self._seq += 1
+            envelopes = []
+        else:
+            envelopes = self._project(entry_id, ("checkpoints", checkpoint))
+        return envelopes + self._project(entry_id, ("values", record.get("values")), first_index=1)
+
+    def _project(self, event_id: str, raw_event: Any, *, first_index: int = 0) -> list[dict[str, Any]]:
         """Re-envelope one raw log event into filtered, seq'd envelopes."""
         method, payload = _unwrap(raw_event)
         if method is None:
@@ -141,14 +225,19 @@ class ThreadEventSession:
             event_id = f"synth:{self._run_id}:{method}"
         params = payload.get("params") if isinstance(payload, dict) else None
         timestamp = params.get("timestamp") if isinstance(params, dict) else None
-        return self._emit(self._channel_events(method, payload), event_id, timestamp=timestamp)
+        return self._emit(self._channel_events(method, payload), event_id, timestamp=timestamp, first_index=first_index)
 
     def _emit(
-        self, channel_events: list[_ChannelEvent], event_id: str, *, timestamp: int | None = None
+        self,
+        channel_events: list[_ChannelEvent],
+        event_id: str,
+        *,
+        timestamp: int | None = None,
+        first_index: int = 0,
     ) -> list[dict[str, Any]]:
         """Filter + seq a batch of channel events into wire envelopes."""
         envelopes: list[dict[str, Any]] = []
-        for index, (channel, data, namespace) in enumerate(channel_events):
+        for index, (channel, data, namespace) in enumerate(channel_events, start=first_index):
             # seq counts before channel filtering — absolute cursor, so a
             # reconnect with a different channel set still resumes correctly.
             self._seq += 1
@@ -371,6 +460,12 @@ def _prefix_matches(namespace: list[str], prefix: tuple[str, ...]) -> bool:
         if candidate.split(":", 1)[0] != segment:
             return False
     return True
+
+
+def _marker_namespace(raw_event: Any) -> str | None:
+    """The namespace key of a snapshot marker entry, else None."""
+    method, payload = _unwrap(raw_event)
+    return payload if method == SNAPSHOT_MARKER and isinstance(payload, str) else None
 
 
 def _is_terminal(raw_event: Any) -> bool:

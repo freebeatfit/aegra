@@ -124,7 +124,7 @@ sequenceDiagram
     W->>W: execute_run(job)
 
     loop For each event
-        W->>R: XADD event (thread stream)
+        W->>R: XADD event, or HSET snapshot + XADD marker (one script)
     end
 
     W->>PG: UPDATE status=success, output={...}
@@ -295,7 +295,9 @@ sequenceDiagram
 | Key | Purpose | Written by | Read by |
 |:----|:--------|:-----------|:--------|
 | `aegra:jobs` | Job queue (BLPOP) | API (RPUSH) | Worker (BLPOP) |
-| `aegra:run:thread:{<thread_id>}:events` | Events of every run on the thread (TTL 10 min after the last write) | Worker (XADD) | API (XREAD BLOCK) |
+| `aegra:run:thread:{<thread_id>}:events` | Events of every run on the thread, and a marker per state snapshot | Worker (Lua: XADD MINID) | API (XREAD BLOCK) |
+| `aegra:run:thread:{<thread_id>}:snapshots` | Latest `values` and checkpoint envelope per namespace | Worker (Lua: HSET) | API (HMGET) |
+| `aegra:run:thread:{<thread_id>}:snapshot-ids` | Marker entry id of each snapshot | Worker (Lua: HSET) | API (HGETALL) |
 | `aegra:run:cancel` | Cancel commands | API (PUBLISH) | Worker (SUBSCRIBE) |
 | `aegra:run:done:{run_id}` | Completion signal (TTL 1h) | Worker (SET) | API (EXISTS) |
 

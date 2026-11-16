@@ -12,9 +12,10 @@ from aegra_api.core.active_runs import active_runs
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import (
     READ_BATCH,
-    REPLAY_MAX_EVENTS,
-    REPLAY_RETENTION_SECONDS,
+    ROOT_NAMESPACE,
+    SNAPSHOT_MARKER,
     BaseBrokerManager,
+    Snapshot,
     ThreadEntry,
     entry_key,
 )
@@ -30,7 +31,8 @@ _READ_WAIT_SECONDS = 5.0
 
 class _ThreadLog:
     def __init__(self) -> None:
-        self.entries: deque[ThreadEntry] = deque(maxlen=REPLAY_MAX_EVENTS)
+        self.entries: deque[ThreadEntry] = deque()
+        self.snapshots: dict[str, Snapshot] = {}
         self.last_key = (0, 0)
         self.last_write = time.monotonic()
         # Replaced on every write, so a reader waits on the one current when it looked.
@@ -44,6 +46,23 @@ class _ThreadLog:
             fresh.append(entry)
         fresh.reverse()
         return fresh[:READ_BATCH]
+
+    def write(self, run_id: str, write_id: str, event: Any) -> str:
+        """Trim like the Redis backend's ``XADD MINID``, append, and wake readers. Returns the entry id."""
+        ms = time.time_ns() // 1_000_000
+        oldest = ms - settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS * 1000
+        if root := self.snapshots.get(ROOT_NAMESPACE):
+            oldest = min(oldest, entry_key(root[0])[0])
+        while self.entries and entry_key(self.entries[0][0])[0] < oldest:
+            self.entries.popleft()
+        last_ms, last_n = self.last_key
+        self.last_key = (ms, 0) if ms > last_ms else (last_ms, last_n + 1)
+        entry_id = f"{self.last_key[0]}-{self.last_key[1]}"
+        self.entries.append((entry_id, run_id, write_id, event))
+        self.last_write = time.monotonic()
+        written, self.written = self.written, asyncio.Event()
+        written.set()
+        return entry_id
 
 
 class BrokerManager(BaseBrokerManager):
@@ -61,14 +80,13 @@ class BrokerManager(BaseBrokerManager):
         return log
 
     async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> None:
+        self._log(thread_id).write(run_id, write_id, event)
+
+    async def put_snapshot(
+        self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+    ) -> None:
         log = self._log(thread_id)
-        ms = time.time_ns() // 1_000_000
-        last_ms, last_n = log.last_key
-        log.last_key = (ms, 0) if ms > last_ms else (last_ms, last_n + 1)
-        log.entries.append((f"{log.last_key[0]}-{log.last_key[1]}", run_id, write_id, event))
-        log.last_write = time.monotonic()
-        written, log.written = log.written, asyncio.Event()
-        written.set()
+        log.snapshots[namespace] = (log.write(run_id, write_id, (SNAPSHOT_MARKER, namespace)), record)
 
     async def read_thread(self, thread_id: str, after: str) -> list[ThreadEntry]:
         key = entry_key(after)
@@ -79,6 +97,13 @@ class BrokerManager(BaseBrokerManager):
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(written.wait(), _READ_WAIT_SECONDS)
         return self._log(thread_id).after(key)
+
+    async def read_snapshot_ids(self, thread_id: str) -> dict[str, str]:
+        return {namespace: entry_id for namespace, (entry_id, _) in self._log(thread_id).snapshots.items()}
+
+    async def read_snapshots(self, thread_id: str, namespaces: list[str]) -> dict[str, Snapshot]:
+        snapshots = self._log(thread_id).snapshots
+        return {namespace: snapshots[namespace] for namespace in namespaces if namespace in snapshots}
 
     async def start(self) -> None:
         """Start the periodic cleanup task."""
@@ -109,8 +134,10 @@ class BrokerManager(BaseBrokerManager):
         if emit_end_event:
             await self.end_cancelled_run(run_id)
 
-    def sweep_expired_logs(self, retention_seconds: float = REPLAY_RETENTION_SECONDS) -> list[str]:
+    def sweep_expired_logs(self, retention_seconds: float | None = None) -> list[str]:
         """Drop thread logs not written to within the replay window. Returns their thread ids."""
+        if retention_seconds is None:
+            retention_seconds = settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
         now = time.monotonic()
         expired = [thread_id for thread_id, log in self._logs.items() if now - log.last_write > retention_seconds]
         for thread_id in expired:

@@ -916,3 +916,145 @@ class TestStaysOpen:
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(stream.__anext__(), timeout=0.4)
         await stream.aclose()
+
+
+async def _publish(
+    manager: BrokerManager, run_id: str, events: list[tuple[str, Any]], *, thread_id: str = "t1"
+) -> None:
+    """Write events the way a run does, so values become namespace snapshots."""
+    broker = manager.get_or_create_broker(run_id, thread_id)
+    for raw in events:
+        await broker.put(raw)
+
+
+def _step(step: int, data: Any, namespace: list[str] | None = None) -> list[tuple[str, Any]]:
+    """A superstep's checkpoint envelope and the values it precedes."""
+    envelope = {"id": f"c{step}", "step": step}
+    return [
+        ("checkpoints", _protocol_event("checkpoints", envelope, namespace=namespace, timestamp=step)),
+        ("values", _protocol_event("values", data, namespace=namespace, timestamp=step)),
+    ]
+
+
+def _shape(events: list[dict[str, Any]]) -> list[tuple[str, list[str], Any]]:
+    return [(e["method"], e["params"]["namespace"], e["params"]["data"]) for e in events]
+
+
+_STATE = {"values", "checkpoints", "updates", "lifecycle"}
+
+
+class TestLatestStateReplay:
+    """A connection replays each namespace's latest snapshot, then the log after the earliest one."""
+
+    async def test_replay_is_the_latest_snapshot_then_the_later_deltas(self, manager: BrokerManager) -> None:
+        update = ("updates", _protocol_event("updates", {"n": {"b": 1}}))
+        await _publish(
+            manager, "run-1", [*_step(0, {"a": 0}), update, *_step(1, {"a": 1}), update, ("end", {"status": "success"})]
+        )
+
+        events = await _collect(_make_session("t1", channels=_STATE))
+
+        assert _shape(events)[1:] == [
+            ("checkpoints", [], {"id": "c1", "step": 1}),
+            ("values", [], {"a": 1}),
+            ("updates", [], {"node": "n", "values": {"b": 1}}),
+            ("lifecycle", [], {"event": "completed"}),
+        ]
+        assert events[0]["params"]["data"] == {"event": "running"}
+        assert [e["params"]["timestamp"] for e in events[1:3]] == [1, 1]
+
+    async def test_a_nested_snapshot_older_than_the_roots_starts_the_replay(self, manager: BrokerManager) -> None:
+        await _publish(manager, "run-1", [*_step(0, {"r": 0}), *_step(0, {"s": 0}, ["sub:1"]), *_step(1, {"r": 1})])
+
+        events = await _collect(_make_session("t1", channels=_STATE))
+
+        assert [(method, ns) for method, ns, _ in _shape(events)] == [
+            ("lifecycle", []),
+            ("checkpoints", ["sub:1"]),
+            ("values", ["sub:1"]),
+            ("checkpoints", []),
+            ("values", []),
+        ]
+        assert _shape(events)[-1] == ("values", [], {"r": 1})
+
+    async def test_a_snapshot_whose_marker_was_trimmed_comes_first(self, manager: BrokerManager) -> None:
+        await _publish(
+            manager, "run-1", [*_step(0, {"s": 0}, ["sub:1"]), *_step(1, {"r": 1}), ("end", {"status": "success"})]
+        )
+        manager._log("t1").entries.popleft()  # the subgraph's marker
+
+        events = await _collect(_make_session("t1", channels=_STATE))
+
+        assert [(method, ns) for method, ns, _ in _shape(events)] == [
+            ("checkpoints", ["sub:1"]),
+            ("values", ["sub:1"]),
+            ("lifecycle", []),
+            ("checkpoints", []),
+            ("values", []),
+            ("lifecycle", []),
+        ]
+        seqs = [e["seq"] for e in events]
+        assert seqs == sorted(set(seqs))
+
+    async def test_snapshot_ids_and_seqs_are_their_markers_on_every_connection(self, manager: BrokerManager) -> None:
+        await _publish(manager, "run-1", [*_step(0, {"a": 0}), ("end", {"status": "success"})])
+        marker = manager._log("t1").entries[0][0]
+
+        first = await _collect(_make_session("t1", channels=_STATE))
+        second = await _collect(_make_session("t1", channels=_STATE))
+
+        assert [e["event_id"] for e in first[1:3]] == [f"{marker}:0", f"{marker}:1"]
+        assert [(e["event_id"], e["seq"]) for e in first] == [(e["event_id"], e["seq"]) for e in second]
+
+    async def test_a_marker_whose_snapshot_was_replaced_is_skipped(
+        self, manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await _publish(manager, "run-1", _step(0, {"a": 0}))
+        read_snapshots = manager.read_snapshots
+        reads: list[list[str]] = []
+
+        async def racing_read(thread_id: str, namespaces: list[str]) -> Any:
+            if not reads:  # the run replaces the snapshot after the stream saw the first marker's id
+                await _publish(manager, "run-1", _step(1, {"a": 1}))
+            reads.append(namespaces)
+            return await read_snapshots(thread_id, namespaces)
+
+        monkeypatch.setattr(manager, "read_snapshots", racing_read)
+
+        events = await _collect(_make_session("t1", channels=_STATE))
+
+        assert _shape(events)[1:] == [("checkpoints", [], {"id": "c1", "step": 1}), ("values", [], {"a": 1})]
+        assert len(reads) == 1  # the newer snapshot, read once, waited for its own marker
+
+    async def test_a_stream_without_state_channels_reads_no_snapshot(
+        self, manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await _publish(manager, "run-1", [*_step(0, {"a": 0}), ("end", {"status": "success"})])
+
+        async def no_read(thread_id: str, namespaces: list[str]) -> Any:
+            raise AssertionError("read a snapshot for a stream that wants none")
+
+        monkeypatch.setattr(manager, "read_snapshots", no_read)
+
+        events = await _collect(_make_session("t1", channels={"lifecycle"}))
+
+        assert [e["params"]["data"]["event"] for e in events] == ["running", "completed"]
+
+    async def test_namespace_filter_leaves_out_other_snapshots(self, manager: BrokerManager) -> None:
+        await _publish(manager, "run-1", [*_step(0, {"s": 0}, ["sub:1"]), *_step(1, {"r": 1})])
+
+        events = await _collect(_make_session("t1", channels=_STATE, depth=0))
+
+        assert [(method, ns) for method, ns, _ in _shape(events)] == [
+            ("lifecycle", []),
+            ("checkpoints", []),
+            ("values", []),
+        ]
+
+    async def test_interrupt_values_stay_deltas_after_the_snapshot(self, manager: BrokerManager) -> None:
+        interrupted = ("values", _protocol_event("values", {"a": 0}, interrupts=[{"id": "i-1", "value": "q"}]))
+        await _publish(manager, "run-1", [*_step(0, {"a": 0}), interrupted, ("end", {"status": "interrupted"})])
+
+        events = await _collect(_make_session("t1", channels={"values", "input", "lifecycle"}))
+
+        assert [e["method"] for e in events] == ["lifecycle", "values", "input.requested", "values", "lifecycle"]

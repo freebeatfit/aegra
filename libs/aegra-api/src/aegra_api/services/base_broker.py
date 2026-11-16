@@ -4,9 +4,17 @@ Every event of every run on a thread goes to one log per thread, in producer
 order (a Redis Stream when ``REDIS_BROKER_ENABLED=true``, a list in dev mode).
 A thread stream reads the log from its cursor, the entry id, with a bounded
 blocking read, so a run started after the stream opened shows up on it.
+
+Full state is kept once per namespace, not in the log: a ``values`` event (with
+the checkpoint envelope just before it) replaces the namespace's snapshot and
+appends a small marker entry in the same atomic write. ``values`` events that
+carry interrupts stay in the log as deltas. Each write trims log entries older
+than ``RESUMABLE_STREAM_TTL_SECONDS``, but never the root snapshot's marker or
+anything after it, and the thread's keys expire one window after its last write.
 """
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
 from typing import Any
 from uuid import uuid4
@@ -17,17 +25,21 @@ from aegra_api.models.enums import RunCancellationAction
 
 logger = structlog.getLogger(__name__)
 
-# A thread's log expires this long after its last write. Reconnects happen in
-# seconds; this is the documented window in docs/guides/streaming.mdx.
-REPLAY_RETENTION_SECONDS = 600
-# Entries kept per thread log (approximate in Redis).
-REPLAY_MAX_EVENTS = 10_000
 # Entries returned per read.
 READ_BATCH = 200
 
 # (entry_id, run_id, write_id, event). entry_id is "<ms>-<n>" and rises with
-# every write on the thread; a retried write keeps its write_id.
+# every write on the thread; a retried write keeps its write_id. A marker's event
+# is (SNAPSHOT_MARKER, namespace key): its snapshot lives in the thread's snapshots.
 ThreadEntry = tuple[str, str, str, Any]
+SNAPSHOT_MARKER = "snapshot"
+# (marker entry id, record): the record is {"run_id", "checkpoint": envelope event or None, "values": event}.
+Snapshot = tuple[str, dict[str, Any]]
+ROOT_NAMESPACE = "[]"
+
+
+def namespace_key(namespace: list[str]) -> str:
+    return json.dumps(namespace, separators=(",", ":"))
 
 
 def is_end_event(event: Any) -> bool:
@@ -40,6 +52,38 @@ def entry_key(entry_id: str) -> tuple[int, int]:
     return int(ms), int(n or 0)
 
 
+def entry_before(entry_id: str) -> str:
+    """The cursor a read starts from to include *entry_id*."""
+    ms, n = entry_key(entry_id)
+    return f"{ms}-{n - 1}" if n else f"{ms - 1}-{2**64 - 1}"
+
+
+def _method(event: Any) -> Any:
+    return event[0] if isinstance(event, (tuple, list)) and event else None
+
+
+def _params(event: Any) -> dict[str, Any]:
+    payload = event[1] if isinstance(event, (tuple, list)) and len(event) == 2 else None
+    params = payload.get("params") if isinstance(payload, dict) else None
+    return params if isinstance(params, dict) else {}
+
+
+def _namespace(event: Any) -> list[str]:
+    namespace = _params(event).get("namespace")
+    return namespace if isinstance(namespace, list) else []
+
+
+def _is_snapshot(event: Any) -> bool:
+    """A ``values`` event without interrupts: it replaces its namespace's snapshot."""
+    params = _params(event)
+    data = params.get("data")
+    return (
+        _method(event) == "values"
+        and not params.get("interrupts")
+        and not (isinstance(data, dict) and "__interrupt__" in data)
+    )
+
+
 class RunBroker:
     """Writes one run's events to its thread's log and remembers that the run ended."""
 
@@ -50,6 +94,8 @@ class RunBroker:
         self._finished = False
         # Keeps this run's writes in order when a signal races a retrying write.
         self._write_lock = asyncio.Lock()
+        # A checkpoints event waits for the values it precedes, to be stored with it.
+        self._held: Any = None
 
     async def put(self, event: Any) -> None:
         """Append *event* (a ``(method, payload)`` pair) unless the run already ended."""
@@ -59,7 +105,31 @@ class RunBroker:
         if is_end_event(event):
             self._finished = True
         async with self._write_lock:
-            await self._manager.append(self.thread_id, self.run_id, uuid4().hex, event)
+            held, self._held = self._held, None
+            if _is_snapshot(event) and held is not None and _namespace(held) == _namespace(event):
+                await self._snapshot(held, event)
+                return
+            if held is not None:
+                await self._append(held)
+            if _method(event) == "checkpoints":
+                self._held = event
+            elif _is_snapshot(event):
+                await self._snapshot(None, event)
+            else:
+                await self._append(event)
+
+    async def _append(self, event: Any) -> None:
+        await self._manager.append(self.thread_id, self.run_id, uuid4().hex, event)
+
+    async def _snapshot(self, checkpoint: Any, values: Any) -> None:
+        record = {
+            "run_id": self.run_id,
+            "checkpoint": None if checkpoint is None else checkpoint[1],
+            "values": values[1],
+        }
+        await self._manager.put_snapshot(
+            self.thread_id, self.run_id, uuid4().hex, namespace_key(_namespace(values)), record
+        )
 
     def mark_finished(self) -> None:
         self._finished = True
@@ -100,11 +170,25 @@ class BaseBrokerManager(ABC):
         """Append one event to the thread's log. A write that keeps failing is logged, not raised."""
 
     @abstractmethod
+    async def put_snapshot(
+        self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+    ) -> None:
+        """Replace *namespace*'s snapshot with *record* and append its marker, in one atomic write."""
+
+    @abstractmethod
     async def read_thread(self, thread_id: str, after: str) -> list[ThreadEntry]:
         """Up to ``READ_BATCH`` entries after entry id *after*, waiting a bounded time for one.
 
         An empty list means none arrived in time; ``"0-0"`` reads from the oldest kept entry.
         """
+
+    @abstractmethod
+    async def read_snapshot_ids(self, thread_id: str) -> dict[str, str]:
+        """The marker entry id of each namespace's snapshot."""
+
+    @abstractmethod
+    async def read_snapshots(self, thread_id: str, namespaces: list[str]) -> dict[str, Snapshot]:
+        """The current snapshots of *namespaces* that exist."""
 
     @abstractmethod
     async def start(self) -> None:

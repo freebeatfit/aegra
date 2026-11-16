@@ -1,12 +1,12 @@
 """Redis-backed broker for multi-instance streaming.
 
-Each thread's events live in one Redis Stream, ``<prefix>thread:{<thread_id>}:events``
-(the braces are a Cluster hash tag, so a thread's keys share a slot). Every run
-on the thread appends to it; a thread stream reads it with ``XREAD BLOCK`` from
-its cursor on a connection from a dedicated pool. Writes trim the stream to
-about ``REPLAY_MAX_EVENTS`` entries and expire it ``REPLAY_RETENTION_SECONDS``
-after the last one. Cancel commands still go over pub/sub: they are signals,
-not data.
+Each thread's events live in one Redis Stream, ``<prefix>thread:{<thread_id>}:events``,
+and its latest full state per namespace in two hashes, ``...:snapshots`` (namespace ->
+record) and ``...:snapshot-ids`` (namespace -> marker entry id). The braces are a
+Cluster hash tag, so a thread's keys share a slot. Every run on the thread appends
+to the stream; a thread stream reads it with ``XREAD BLOCK`` from its cursor on a
+connection from a dedicated pool. Cancel commands still go over pub/sub: they are
+signals, not data.
 """
 
 import asyncio
@@ -26,9 +26,10 @@ from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import (
     READ_BATCH,
-    REPLAY_MAX_EVENTS,
-    REPLAY_RETENTION_SECONDS,
+    ROOT_NAMESPACE,
+    SNAPSHOT_MARKER,
     BaseBrokerManager,
+    Snapshot,
     ThreadEntry,
 )
 from aegra_api.settings import settings
@@ -46,6 +47,27 @@ _BACKOFF_FACTOR = 2.0
 # blip is retried rather than dropping the event. Readers drop a retried copy by write id.
 _PUT_MAX_ATTEMPTS = 3
 
+# One atomic write per event; the keys share the thread's hash tag (one Cluster slot). A script, not MULTI,
+# so a snapshot records its marker's id and the time trim stops at the root snapshot's marker.
+# ARGV: window ms, TTL s, run id, write id, namespace ("" for a plain event), payload.
+_WRITE_SCRIPT = f"""
+local now = redis.call('TIME')
+local oldest = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) - tonumber(ARGV[1])
+local root = redis.call('HGET', KEYS[2], '{ROOT_NAMESPACE}')
+if root then oldest = math.min(oldest, tonumber(string.match(root, '^%d+'))) end
+local minid = string.format('%.0f', oldest)
+local id
+if ARGV[5] == '' then
+  id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 'r', ARGV[3], 'w', ARGV[4], 'e', ARGV[6])
+else
+  id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 'r', ARGV[3], 'w', ARGV[4], 'm', ARGV[5])
+  redis.call('HSET', KEYS[2], ARGV[5], id)
+  redis.call('HSET', KEYS[3], ARGV[5], ARGV[6])
+end
+for i = 1, 3 do redis.call('EXPIRE', KEYS[i], ARGV[2]) end
+return id
+"""
+
 
 def _serialize_payload(payload: Any) -> str:
     """Serialize an event payload to a JSON string for Redis transport."""
@@ -62,6 +84,13 @@ def _deserialize_payload(raw: Any) -> Any:
     if isinstance(raw, list) and len(raw) >= 1 and isinstance(raw[0], str):
         return tuple(raw)
     return raw
+
+
+def _entry_event(fields: dict[str, str]) -> Any:
+    """A stream entry's event: the stored one, or a snapshot marker's (SNAPSHOT_MARKER, namespace)."""
+    if "m" in fields:
+        return (SNAPSHOT_MARKER, fields["m"])
+    return _deserialize_payload(json.loads(fields["e"]))
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -98,18 +127,29 @@ class RedisBrokerManager(BaseBrokerManager):
         self._running: bool = False
 
     def stream_key(self, thread_id: str) -> str:
-        return f"{self._channel_prefix}thread:{{{thread_id}}}:events"
+        return self._keys(thread_id)[0]
+
+    def _keys(self, thread_id: str) -> list[str]:
+        """The stream, snapshot-ids and snapshots keys of a thread."""
+        base = f"{self._channel_prefix}thread:{{{thread_id}}}"
+        return [f"{base}:events", f"{base}:snapshot-ids", f"{base}:snapshots"]
 
     async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> None:
-        fields = {"r": run_id, "w": write_id, "e": _serialize_payload(event)}
-        key = self.stream_key(thread_id)
+        await self._write(thread_id, run_id, write_id, "", _serialize_payload(event))
+
+    async def put_snapshot(
+        self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+    ) -> None:
+        await self._write(thread_id, run_id, write_id, namespace, _serialize_payload(record))
+
+    async def _write(self, thread_id: str, run_id: str, write_id: str, namespace: str, payload: str) -> None:
+        window = settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
+        args = [window * 1000, window, run_id, write_id, namespace, payload]
         attempt = 0
         while True:
             try:
-                pipe = redis_manager.get_client().pipeline()
-                pipe.xadd(key, fields, maxlen=REPLAY_MAX_EVENTS, approximate=True)
-                pipe.expire(key, REPLAY_RETENTION_SECONDS)
-                await pipe.execute()
+                # EVALSHA, loading the script on a NOSCRIPT reply.
+                await redis_manager.get_client().register_script(_WRITE_SCRIPT)(keys=self._keys(thread_id), args=args)
                 return
             except RedisError as e:
                 attempt += 1
@@ -130,10 +170,23 @@ class RedisBrokerManager(BaseBrokerManager):
             return []
         # RESP2 answers [[key, entries]], RESP3 {key: [entries]}.
         entries = reply[key][0] if isinstance(reply, dict) else reply[0][1]
-        return [
-            (entry_id, fields["r"], fields["w"], _deserialize_payload(json.loads(fields["e"])))
-            for entry_id, fields in entries
-        ]
+        return [(entry_id, fields["r"], fields["w"], _entry_event(fields)) for entry_id, fields in entries]
+
+    async def read_snapshot_ids(self, thread_id: str) -> dict[str, str]:
+        return await redis_manager.get_client().hgetall(self._keys(thread_id)[1])  # type: ignore[invalid-await]  # redis.asyncio stubs
+
+    async def read_snapshots(self, thread_id: str, namespaces: list[str]) -> dict[str, Snapshot]:
+        _, ids_key, snapshots_key = self._keys(thread_id)
+        # One transaction, so each id belongs to the record read with it.
+        pipe = redis_manager.get_client().pipeline(transaction=True)
+        pipe.hmget(ids_key, namespaces)
+        pipe.hmget(snapshots_key, namespaces)
+        ids, records = await pipe.execute()
+        return {
+            namespace: (entry_id, json.loads(record))
+            for namespace, entry_id, record in zip(namespaces, ids, records, strict=True)
+            if entry_id is not None and record is not None
+        }
 
     async def start(self) -> None:
         """Start the cancel command listener."""
