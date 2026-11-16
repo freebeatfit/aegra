@@ -38,16 +38,24 @@ def error_envelope(error: str, message: str) -> dict[str, Any]:
     return {ERROR_KEY: {"error": error, "message": message}}
 
 
-def run_result_body(run_orm: RunORM | None, run_id: str, *, timed_out: bool = False) -> dict[str, Any]:
+def run_result_body(
+    run_orm: RunORM | None,
+    run_id: str,
+    *,
+    timed_out: bool = False,
+    thread_values: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """The run's output when it has one, otherwise an ``__error__`` envelope saying why not.
 
     An interrupt is a human-review pause rather than a failure, so it keeps
-    returning its partial output.
+    returning its partial output. A v2 run stores no output; its result is the
+    thread's current values (*thread_values*), as the LangGraph Agent Server
+    answers join/wait.
     """
     if run_orm is None:
         return error_envelope("RunNotFound", f"Run '{run_id}' no longer exists")
     if run_orm.status in _STATES_WITH_OUTPUT:
-        return run_orm.output or {}
+        return run_orm.output or thread_values or {}
     if run_orm.status == "error":
         return error_envelope("Error", run_orm.error_message or "Run failed")
     if run_orm.status == "timeout":
@@ -67,6 +75,7 @@ async def read_run_result(
     user_id: str,
     *,
     timed_out: bool = False,
+    user: Any = None,
 ) -> dict[str, Any]:
     """Open a short-lived DB session and build the run's final response body."""
     maker = _get_session_maker()
@@ -78,7 +87,39 @@ async def read_run_result(
                 RunORM.user_id == user_id,
             )
         )
-    return run_result_body(run_orm, run_id, timed_out=timed_out)
+    thread_values = await thread_values_for(run_orm, user) if user is not None else None
+    return run_result_body(run_orm, run_id, timed_out=timed_out, thread_values=thread_values)
+
+
+async def thread_values_for(run_orm: RunORM | None, user: Any) -> dict[str, Any] | None:
+    """The thread's current values for a settled run that stored no output.
+
+    None when the run stored an output, isn't settled with a result, or the
+    state can't be read; the caller then answers as before.
+    """
+    if run_orm is None or run_orm.output or run_orm.status not in _STATES_WITH_OUTPUT:
+        return None
+    try:
+        from aegra_api.core.orm import Assistant as AssistantORM
+        from aegra_api.services.langgraph_service import create_thread_config, get_langgraph_service
+
+        maker = _get_session_maker()
+        async with maker() as session:
+            graph_id = await session.scalar(
+                select(AssistantORM.graph_id).where(AssistantORM.assistant_id == run_orm.assistant_id)
+            )
+        if not graph_id:
+            return None
+        config = create_thread_config(run_orm.thread_id, user)
+        async with get_langgraph_service().get_graph(
+            graph_id, config=config, access_context="threads.read", user=user
+        ) as graph:
+            snapshot = await graph.aget_state(config)
+        values = getattr(snapshot, "values", None)
+        return values if isinstance(values, dict) else None
+    except Exception:
+        logger.warning("Could not read thread values for a run result", run_id=run_orm.run_id, exc_info=True)
+        return None
 
 
 def encode_output(output: dict[str, Any]) -> bytes:
@@ -92,6 +133,7 @@ async def heartbeat_wait_body(
     user_id: str,
     *,
     timeout: float,
+    user: Any = None,
 ) -> AsyncIterator[bytes]:
     """Async generator that keeps the HTTP connection alive while waiting.
 
@@ -137,5 +179,5 @@ async def heartbeat_wait_body(
                     exc_info=task.exception(),
                 )
 
-    result = await read_run_result(run_id, thread_id, user_id, timed_out=timed_out)
+    result = await read_run_result(run_id, thread_id, user_id, timed_out=timed_out, user=user)
     yield encode_output(result)

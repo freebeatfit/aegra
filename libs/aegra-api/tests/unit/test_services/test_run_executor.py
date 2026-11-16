@@ -502,3 +502,57 @@ class TestTerminalStateRaces:
             await execute_run(_make_job())
 
         mock_signal_end.assert_not_awaited()
+
+
+class TestRunOutputStorage:
+    """FB patch P5: a v2 run stores no copy of the final state."""
+
+    @staticmethod
+    async def _finalized_output(*, v2: bool, interrupted: bool = False) -> object:
+        result = _GraphResult()
+        result.data = {"messages": ["x" * 1000]}
+        result.has_interrupt = interrupted
+        job = RunJob(
+            identity=RunIdentity(run_id="run-1", thread_id="thread-1", graph_id="graph-1"),
+            user=User(identity="user-1"),
+            execution=RunExecution(input_data={"msg": "hello"}, event_streaming_v2=v2),
+        )
+        mock_finalize = AsyncMock(return_value=True)
+        with (
+            patch("aegra_api.services.run_executor.start_run", AsyncMock(return_value=True)),
+            patch("aegra_api.services.run_executor.finalize_run", mock_finalize),
+            patch("aegra_api.services.run_executor._stream_graph", AsyncMock(return_value=result)),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._signal_end_event", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor._signal_run_done", new_callable=AsyncMock),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            await execute_run(job)
+        return mock_finalize.await_args.kwargs["output"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interrupted", [False, True])
+    async def test_v2_run_stores_no_output(self, interrupted: bool) -> None:
+        assert await self._finalized_output(v2=True, interrupted=interrupted) is None
+
+    @pytest.mark.asyncio
+    async def test_v1_run_keeps_its_output(self) -> None:
+        assert await self._finalized_output(v2=False) == {"messages": ["x" * 1000]}
+
+    @pytest.mark.asyncio
+    async def test_native_v2_stream_does_not_collect_values(self) -> None:
+        async def events():  # type: ignore[no-untyped-def]
+            yield "values", {"params": {"data": {"messages": ["big"]}}}
+            yield "values", {"params": {"data": {"messages": []}, "interrupts": [{"id": "i"}]}}
+
+        result = _GraphResult()
+        with (
+            patch.object(run_executor_module, "stream_native_v3_events", MagicMock(return_value=events())),
+            patch.object(run_executor_module, "broker_manager") as mock_bm,
+            patch.object(run_executor_module, "streaming_service") as mock_streaming,
+        ):
+            mock_bm.allocate_event_id = AsyncMock(return_value="run-1_event_1")
+            mock_streaming.put_to_broker = AsyncMock()
+            await _stream_native_v2(TestDurabilityForwarding._job(None), MagicMock(), {}, {}, result)
+        assert result.data == {}
+        assert result.has_interrupt is True

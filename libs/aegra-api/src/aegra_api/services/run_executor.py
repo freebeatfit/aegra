@@ -55,6 +55,10 @@ async def execute_run(job: RunJob) -> None:
             return
 
         final_output = await _stream_graph(job)
+        # A v2 run's state lives in its checkpoint; the LangGraph Agent Server
+        # stores no run output and join/wait read the thread's values on demand
+        # (run_waiters). Keeping the last full state per run duplicated it.
+        stored_output = None if job.execution.event_streaming_v2 else final_output.data
 
         if final_output.has_interrupt:
             finalized = await finalize_run(
@@ -63,7 +67,7 @@ async def execute_run(job: RunJob) -> None:
                 user_id=user_id,
                 status="interrupted",
                 thread_status="interrupted",
-                output=final_output.data,
+                output=stored_output,
             )
         else:
             finalized = await finalize_run(
@@ -72,7 +76,7 @@ async def execute_run(job: RunJob) -> None:
                 user_id=user_id,
                 status="success",
                 thread_status="idle",
-                output=final_output.data,
+                output=stored_output,
             )
 
     except asyncio.CancelledError:
@@ -255,8 +259,6 @@ async def _stream_native_v2(
         # in a values/updates payload (the path session.py routes to input.requested).
         if params.get("interrupts") or (isinstance(data, dict) and "__interrupt__" in data):
             result.has_interrupt = True
-        if method == "values" and isinstance(data, dict):
-            result.data = data
 
 
 def _build_run_config(job: RunJob) -> dict[str, Any]:

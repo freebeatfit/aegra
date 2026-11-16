@@ -26,7 +26,13 @@ from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.run_preparation import _prepare_run
 from aegra_api.services.run_status import interrupt_unowned_run
-from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body, run_result_body
+from aegra_api.services.run_waiters import (
+    TERMINAL_STATES,
+    encode_output,
+    heartbeat_wait_body,
+    run_result_body,
+    thread_values_for,
+)
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
 from aegra_api.utils.status_compat import validate_run_status
@@ -342,11 +348,14 @@ async def join_run(
         if not run_orm:
             raise HTTPException(404, f"Run '{run_id}' not found")
 
-        if run_orm.status in TERMINAL_STATES:
-            return StreamingResponse(
-                iter([encode_output(run_result_body(run_orm, str(run_id)))]),
-                media_type="application/json",
-            )
+        terminal = run_orm.status in TERMINAL_STATES
+
+    if terminal:
+        thread_values = await thread_values_for(run_orm, user)
+        return StreamingResponse(
+            iter([encode_output(run_result_body(run_orm, str(run_id), thread_values=thread_values))]),
+            media_type="application/json",
+        )
 
     return StreamingResponse(
         heartbeat_wait_body(
@@ -354,6 +363,7 @@ async def join_run(
             thread_id,
             user.identity,
             timeout=settings.worker.BG_JOB_TIMEOUT_SECS,
+            user=user,
         ),
         media_type="application/json",
         headers={
@@ -402,6 +412,7 @@ async def wait_for_run(
             thread_id,
             user.identity,
             timeout=settings.worker.BG_JOB_TIMEOUT_SECS,
+            user=user,
         ),
         media_type="application/json",
         headers={
