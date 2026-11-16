@@ -66,7 +66,7 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Interrupt before / after | Supported | Pause execution at specific nodes. |
 | User approval gates | Supported | Resume or reject interrupted runs. |
 | State editing | Supported | Modify thread state before resuming. |
-| Answer pending interrupts only | Supported | `input.respond` to an interrupt that is not pending on the thread answers `no_such_interrupt`. While a run is in flight the check is skipped, as on the LangGraph server. |
+| Answer pending interrupts only | Supported | `input.respond` to an interrupt that is not pending on the thread answers `no_such_interrupt`. While a run is in flight the check is skipped, as on the LangGraph server. Of two concurrent answers to one interrupt only the first resumes. |
 | Resume with `update` / `goto` | Supported | `input.respond` folds a state update or directed jump into the resume, one checkpoint. Also available as `command` on v1 run creation. |
 
 ### Storage

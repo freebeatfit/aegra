@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from aegra_api.models import User
 from aegra_api.services.event_streaming import commands as cmd
+from aegra_api.services.run_preparation import InterruptNotPendingError
 
 _CHECKPOINT_ID = "1ef4f797-8335-6428-8001-8a1503f9b875"
 
@@ -576,6 +577,24 @@ class TestErrors:
             "error": "unknown_error",
             "message": "Thread is already running a task.",
         }
+        assert run_id is None
+
+    async def test_interrupt_answered_concurrently_is_no_such_interrupt(
+        self, monkeypatch: pytest.MonkeyPatch, user: User
+    ) -> None:
+        async def answered(*_a: Any, **_k: Any) -> None:
+            raise InterruptNotPendingError("The thread's interrupt was already answered.")
+
+        monkeypatch.setattr(cmd, "_prepare_run", answered)
+        resp, run_id = await _dispatch(
+            {
+                "id": 5,
+                "method": "input.respond",
+                "params": {"assistant_id": "agent", "interrupt_id": "a" * 32, "response": "yes"},
+            },
+            user,
+        )
+        assert resp["error"] == "no_such_interrupt"
         assert run_id is None
 
     async def test_prepare_http_403_maps_to_permission_denied(

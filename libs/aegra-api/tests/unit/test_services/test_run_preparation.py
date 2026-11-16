@@ -7,11 +7,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
+from langgraph.types import Interrupt
 
 from aegra_api.config import CheckpointerConfig
+from aegra_api.core.database import db_manager
 from aegra_api.models.runs import RunCreate
 from aegra_api.services import run_preparation as mod
 from aegra_api.services.run_preparation import (
+    InterruptNotPendingError,
+    _refuse_if_interrupt_answered,
     _resolve_checkpoint,
     _resolve_durability,
     _validate_resume_command,
@@ -48,6 +52,34 @@ def _patch_fresh_sessions(monkeypatch: pytest.MonkeyPatch, *threads: object) -> 
     ctx.__aenter__ = AsyncMock(return_value=fresh)
     ctx.__aexit__ = AsyncMock(return_value=False)
     monkeypatch.setattr(mod, "_get_session_maker", lambda: MagicMock(return_value=ctx))
+
+
+class TestRefuseIfInterruptAnswered:
+    """Under the thread row lock, a resume of an answered interrupt is refused (REST 409)."""
+
+    @pytest.fixture
+    def checkpointer(self, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+        saver = MagicMock()
+        pending = (Interrupt(value="?", id="a" * 32),)
+        saver.aget_tuple = AsyncMock(return_value=SimpleNamespace(pending_writes=[("t", "__interrupt__", pending)]))
+        monkeypatch.setattr(db_manager, "_checkpointer", saver)
+        return saver
+
+    async def test_thread_no_longer_interrupted_is_refused_with_409(self, checkpointer: MagicMock) -> None:
+        with pytest.raises(InterruptNotPendingError) as refused:
+            await _refuse_if_interrupt_answered(_session_returning("busy"), "t1", {"a" * 32: "yes"})
+        assert refused.value.status_code == 409
+
+    async def test_targeted_interrupt_no_longer_pending_is_refused(self, checkpointer: MagicMock) -> None:
+        with pytest.raises(InterruptNotPendingError, match="c" * 32):
+            await _refuse_if_interrupt_answered(_session_returning("interrupted"), "t1", {"c" * 32: "yes"})
+
+    async def test_pending_targeted_interrupt_passes(self, checkpointer: MagicMock) -> None:
+        await _refuse_if_interrupt_answered(_session_returning("interrupted"), "t1", {"a" * 32: "yes"})
+
+    async def test_untargeted_resume_needs_only_the_interrupted_status(self, checkpointer: MagicMock) -> None:
+        await _refuse_if_interrupt_answered(_session_returning("interrupted"), "t1", {"approved": True})
+        checkpointer.aget_tuple.assert_not_awaited()
 
 
 class TestValidateResumeCommand:

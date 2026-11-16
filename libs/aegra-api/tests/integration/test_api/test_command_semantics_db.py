@@ -33,6 +33,7 @@ from aegra_api.core.orm import get_session
 from aegra_api.models import RunCreate, User
 from aegra_api.services import run_preparation
 from aegra_api.services.event_streaming import capabilities as caps
+from aegra_api.services.event_streaming.commands import handle_command
 from aegra_api.services.run_preparation import _prepare_run
 from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
@@ -177,6 +178,23 @@ async def _command(client: httpx.AsyncClient, thread_id: str, method: str, param
     return resp.json()
 
 
+class _HeldCommit:
+    """A session whose commit waits for ``release``, so a second request can race it."""
+
+    def __init__(self, session: AsyncSession, committing: asyncio.Event, release: asyncio.Event) -> None:
+        self._session = session
+        self._committing = committing
+        self._release = release
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    async def commit(self) -> None:
+        self._committing.set()
+        await self._release.wait()
+        await self._session.commit()
+
+
 def _reject_request() -> RunCreate:
     return RunCreate(assistant_id=_GRAPH_ID, input={"messages": []}, multitask_strategy="reject")
 
@@ -245,22 +263,11 @@ class TestRejectOnBusyThread:
         committing = asyncio.Event()
         release = asyncio.Event()
 
-        class _HeldCommit:
-            def __init__(self, session: AsyncSession) -> None:
-                self._session = session
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self._session, name)
-
-            async def commit(self) -> None:
-                committing.set()
-                await release.wait()
-                await self._session.commit()
-
         user = User(identity=_USER_ID)
         async with maker() as first_session, maker() as second_session:
+            held = _HeldCommit(first_session, committing, release)
             first = asyncio.create_task(
-                _prepare_run(_HeldCommit(first_session), thread_id, _reject_request(), user, initial_status="pending")
+                _prepare_run(held, thread_id, _reject_request(), user, initial_status="pending")
             )
             await asyncio.wait_for(committing.wait(), timeout=_WAIT_TIMEOUT)
             second = asyncio.create_task(
@@ -355,3 +362,37 @@ class TestRespondToPendingInterruptsOnly:
 
         assert envelope["error"] == "no_such_interrupt"
         assert await _run_count(maker, thread_id) == 1
+
+    async def test_concurrent_answers_to_one_interrupt_start_exactly_one_run(
+        self, maker: Maker, answered_thread: tuple[str, str, str]
+    ) -> None:
+        """Two replicas answering one pending interrupt: the second sees the first's answer."""
+        thread_id, _first_id, second_id = answered_thread
+        committing = asyncio.Event()
+        release = asyncio.Event()
+        payload = {
+            "id": 1,
+            "method": "input.respond",
+            "params": {"interrupt_id": second_id, "namespace": [], "response": "yes"},
+        }
+        user = User(identity=_USER_ID)
+
+        async with maker() as first_session, maker() as second_session:
+            held = _HeldCommit(first_session, committing, release)
+            first = asyncio.create_task(handle_command(payload, session=held, thread_id=thread_id, user=user))
+            await asyncio.wait_for(committing.wait(), timeout=_WAIT_TIMEOUT)
+            second = asyncio.create_task(
+                handle_command(payload, session=second_session, thread_id=thread_id, user=user)
+            )
+            # Without the row lock the second answer passes every check before the first commits.
+            await asyncio.sleep(0.3)
+            release.set()
+            (first_envelope, _), (second_envelope, second_run_id) = await asyncio.wait_for(
+                asyncio.gather(first, second), timeout=_WAIT_TIMEOUT
+            )
+
+        assert first_envelope["type"] == "success"
+        assert second_envelope["type"] == "error"
+        assert second_envelope["error"] == "no_such_interrupt"
+        assert second_run_id is None
+        assert await _run_count(maker, thread_id) == 2

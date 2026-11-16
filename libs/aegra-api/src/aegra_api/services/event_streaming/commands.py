@@ -9,8 +9,7 @@ identical; only the transport differs.
 
 from __future__ import annotations
 
-import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from typing import Any
 from uuid import UUID
 
@@ -20,13 +19,17 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.models import User
 from aegra_api.models.runs import RunCreate
 from aegra_api.services.event_streaming.protocol import ErrorCode, build_error, build_success
-from aegra_api.services.run_preparation import _prepare_run
+from aegra_api.services.run_preparation import (
+    INTERRUPT_ID_PATTERN,
+    InterruptNotPendingError,
+    _prepare_run,
+    pending_interrupt_ids,
+)
 
 logger = structlog.getLogger(__name__)
 
@@ -78,6 +81,8 @@ async def handle_command(
             return await _run_start(command_id, params, session=session, thread_id=thread_id, user=user)
         if method == "input.respond":
             return await _input_respond(command_id, params, session=session, thread_id=thread_id, user=user)
+    except InterruptNotPendingError as exc:
+        return build_error(command_id, "no_such_interrupt", str(exc.detail)), None
     except HTTPException as exc:
         return build_error(command_id, _status_to_error_code(exc.status_code), str(exc.detail)), None
     except ValidationError as exc:
@@ -218,13 +223,6 @@ async def _thread_status(session: AsyncSession, thread_id: str, user: User) -> s
     )
 
 
-# langgraph interrupt ids are xxh3-128 hexdigests; a resume map is only
-# recognized as id-targeted when every key matches this shape.
-_INTERRUPT_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
-# The pending-write channel LangGraph saves a task's raised interrupts under.
-_INTERRUPT_CHANNEL = "__interrupt__"
-
-
 async def _input_respond(
     command_id: int,
     params: dict[str, Any],
@@ -317,7 +315,7 @@ def _build_resume(params: dict[str, Any]) -> tuple[Any, tuple[ErrorCode, str] | 
             if not isinstance(entry, dict) or "response" not in entry:
                 return None, ("invalid_argument", "Each responses entry requires interrupt_id and response.")
             interrupt_id = entry.get("interrupt_id")
-            if not isinstance(interrupt_id, str) or not _INTERRUPT_ID_PATTERN.fullmatch(interrupt_id):
+            if not isinstance(interrupt_id, str) or not INTERRUPT_ID_PATTERN.fullmatch(interrupt_id):
                 return None, ("no_such_interrupt", f"Unknown interrupt id {interrupt_id!r}.")
             resume_map[interrupt_id] = entry["response"]
         if not resume_map:
@@ -331,7 +329,7 @@ def _build_resume(params: dict[str, Any]) -> tuple[Any, tuple[ErrorCode, str] | 
     if interrupt_id is None:
         # Untargeted resume: valid only while a single interrupt is pending.
         return params["response"], None
-    if not isinstance(interrupt_id, str) or not _INTERRUPT_ID_PATTERN.fullmatch(interrupt_id):
+    if not isinstance(interrupt_id, str) or not INTERRUPT_ID_PATTERN.fullmatch(interrupt_id):
         return None, ("no_such_interrupt", f"Unknown interrupt id {interrupt_id!r}.")
     return {interrupt_id: params["response"]}, None
 
@@ -346,16 +344,7 @@ async def _non_pending_interrupt(
     """
     if await _thread_status(session, thread_id, user) in (None, "busy"):
         return None
-    saved = await db_manager.get_checkpointer().aget_tuple(
-        {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
-    )
-    pending_writes = (saved.pending_writes if saved else None) or []
-    pending = {
-        getattr(interrupt, "id", None)
-        for _task_id, channel, value in pending_writes
-        if channel == _INTERRUPT_CHANNEL
-        for interrupt in (value if isinstance(value, Sequence) else [value])
-    }
+    pending = await pending_interrupt_ids(thread_id)
     return next((interrupt_id for interrupt_id in interrupt_ids if interrupt_id not in pending), None)
 
 

@@ -5,6 +5,8 @@ resume-command validation, and config/context merging logic.
 """
 
 import asyncio
+import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from functools import cache
 from typing import Any
@@ -18,6 +20,7 @@ from sqlalchemy import ColumnElement, case, func, literal_column, or_, select, u
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.config import load_checkpointer_config
+from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
@@ -222,6 +225,55 @@ async def _reject_if_thread_busy(session: AsyncSession, thread_id: str) -> None:
         )
 
 
+# langgraph interrupt ids are xxh3-128 hexdigests; a resume map is only
+# recognized as id-targeted when every key matches this shape.
+INTERRUPT_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+# The pending-write channel LangGraph saves a task's raised interrupts under.
+_INTERRUPT_CHANNEL = "__interrupt__"
+
+
+class InterruptNotPendingError(HTTPException):
+    """A resume whose interrupt is no longer pending; v2 commands answer it as ``no_such_interrupt``."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(409, detail)
+
+
+async def pending_interrupt_ids(thread_id: str) -> set[str | None]:
+    """Ids of the interrupts pending on the thread's latest root checkpoint."""
+    saved = await db_manager.get_checkpointer().aget_tuple(
+        {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    )
+    pending_writes = (saved.pending_writes if saved else None) or []
+    return {
+        getattr(interrupt, "id", None)
+        for _task_id, channel, value in pending_writes
+        if channel == _INTERRUPT_CHANNEL
+        for interrupt in (value if isinstance(value, Sequence) else [value])
+    }
+
+
+async def _refuse_if_interrupt_answered(session: AsyncSession, thread_id: str, resume: Any) -> None:
+    """Refuse a resume that a concurrent one already answered.
+
+    The thread row stays locked until the caller commits its run and marks the thread busy, so of two
+    answers racing on any replicas only the first resumes.
+    """
+    status = await session.scalar(select(ThreadORM.status).where(ThreadORM.thread_id == thread_id).with_for_update())
+    if status != "interrupted":
+        raise InterruptNotPendingError("The thread's interrupt was already answered.")
+    if not (
+        isinstance(resume, dict)
+        and resume
+        and all(isinstance(key, str) and INTERRUPT_ID_PATTERN.fullmatch(key) for key in resume)
+    ):
+        return
+    pending = await pending_interrupt_ids(thread_id)
+    unknown_id = next((interrupt_id for interrupt_id in resume if interrupt_id not in pending), None)
+    if unknown_id is not None:
+        raise InterruptNotPendingError(f"Unknown or already-consumed interrupt: {unknown_id}")
+
+
 def _resolve_checkpoint(request: RunCreate) -> dict[str, Any] | None:
     """Fold the top-level ``checkpoint_id`` into ``checkpoint``; ``checkpoint`` keys win."""
     if request.checkpoint_id is None:
@@ -277,9 +329,11 @@ async def _prepare_run(
     ``(run_id, run_model, job)``.
     """
     await _validate_resume_command(session, thread_id, request.command)
-    # After the resume check: its settle poll must not hold the lock finalize_run needs.
+    # Lock after the resume check: its settle poll must not hold the lock finalize_run needs.
     if request.multitask_strategy == "reject":
         await _reject_if_thread_busy(session, thread_id)
+    if request.command and "resume" in request.command:
+        await _refuse_if_interrupt_answered(session, thread_id, request.command["resume"])
 
     run_id = str(uuid4())
     langgraph_service = get_langgraph_service()
