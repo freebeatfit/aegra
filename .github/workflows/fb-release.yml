@@ -5,7 +5,13 @@ name: FB release
 on:
   push:
     tags:
-      - "v*+fb.*"
+      # "+" is a filter metacharacter; escape it to match the literal tag.
+      - 'v*\+fb.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v<ver>+fb.<n> tag to (re)build"
+        required: true
 
 permissions:
   contents: write
@@ -21,14 +27,20 @@ jobs:
           POSTGRES_USER: user
           POSTGRES_PASSWORD: password
           POSTGRES_DB: aegra
-        ports: ["5432:5432"]
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U user" --health-interval 5s --health-timeout 5s --health-retries 10
       redis:
         image: redis:7-alpine
-        ports: ["6379:6379"]
+        ports:
+          - 6379:6379
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -61,7 +73,7 @@ jobs:
 
       - name: Check the tag matches the package versions
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${RELEASE_TAG#v}"
           for lib in aegra-api aegra-cli; do
             version=$(grep -m 1 '^version = ' "libs/$lib/pyproject.toml" | cut -d '"' -f 2)
             test "$version" = "$tag" || { echo "$lib is $version, tag is $tag"; exit 1; }
@@ -71,9 +83,9 @@ jobs:
         run: |
           (cd libs/aegra-api && uv build --wheel --out-dir ../../dist)
           (cd libs/aegra-cli && uv build --wheel --out-dir ../../dist)
-          (cd dist && sha256sum *.whl > SHA256SUMS)
+          (cd dist && sha256sum -- *.whl > SHA256SUMS)
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file FB_PATCHES.md
+        run: gh release create "$RELEASE_TAG" dist/* --title "$RELEASE_TAG" --notes-file FB_PATCHES.md
