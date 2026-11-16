@@ -274,7 +274,10 @@ async def _root_lifecycle(thread_id: str, *, terminals: int) -> list[dict[str, A
 @pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_thread_stream_seq_and_run_ids_are_stable_across_connections() -> None:
-    """Each connection numbers a thread's events the same, rising run over run, with synth:<run_id> ids."""
+    """Each connection numbers a thread's events the same, rising run over run, with synth:<run_id> ids.
+
+    A new connection replays from the thread's latest state, so it sees the last run only.
+    """
     if not await _v2_enabled():
         pytest.skip("FF_V2_EVENT_STREAMING is disabled on the server under test")
 
@@ -282,6 +285,8 @@ async def test_thread_stream_seq_and_run_ids_are_stable_across_connections() -> 
     client = get_client(url=_base_url())
     thread = await client.threads.create()
     thread_id = thread["thread_id"]
+    live = asyncio.create_task(_root_lifecycle(thread_id, terminals=2))
+    await asyncio.sleep(0.5)  # the stream is open before the runs start
     run_ids: list[str] = []
     for _ in range(2):
         run = await client.runs.create(
@@ -290,14 +295,16 @@ async def test_thread_stream_seq_and_run_ids_are_stable_across_connections() -> 
         await client.runs.join(thread_id, run["run_id"])
         run_ids.append(run["run_id"])
 
-    first = await _root_lifecycle(thread_id, terminals=2)
-    second = await _root_lifecycle(thread_id, terminals=2)
+    first = await asyncio.wait_for(live, timeout=30)
+    second = await _root_lifecycle(thread_id, terminals=1)
     elog("root lifecycle", [(e["seq"], e["event_id"], e["params"]["data"]["event"]) for e in first])
 
     assert [e["event_id"].split(":")[:2] for e in first] == [["synth", run_ids[0]]] * 2 + [["synth", run_ids[1]]] * 2
     seqs = [e["seq"] for e in first]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
-    assert [(e["seq"], e["event_id"]) for e in second] == [(e["seq"], e["event_id"]) for e in first]
+    assert [e["event_id"] for e in second] == [e["event_id"] for e in first[2:]]
+    # The running seed's seq depends on where a replay starts; the terminal's does not.
+    assert second[-1]["seq"] == first[-1]["seq"]
 
 
 async def _ensure_graph(graph_id: str) -> str:
