@@ -207,17 +207,13 @@ async def test_factory_streams_messages() -> None:
         if_exists="do_nothing",
     )
 
-    thread = await client.threads.create()
-    thread_id = thread["thread_id"]
-
     events: list[dict] = []
-    async for chunk in client.runs.stream(
-        thread_id=thread_id,
-        assistant_id=assistant["assistant_id"],
-        input={"messages": [{"role": "user", "content": "Say hi."}]},
-        stream_mode="updates",
-    ):
-        events.append(chunk)
+    async with client.threads.stream(assistant_id=assistant["assistant_id"]) as ts:
+        await ts.run.start(input={"messages": [{"role": "user", "content": "Say hi."}]})
+        async for event in ts.events:
+            events.append(event)
+            if event.get("method") == "lifecycle" and event["params"]["data"]["event"] in ("completed", "failed"):
+                break
 
     elog("Stream events count", len(events))
     assert len(events) > 0, "Expected at least one stream event from factory graph"

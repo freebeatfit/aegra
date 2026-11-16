@@ -24,13 +24,15 @@ Agent Protocol or the LangGraph SDK. Why the fork exists:
 | P5 | v2 runs stored the final full state in `runs.output` (C5). Now none; join/wait read the thread's values. | `feat(api)!: store no final state on v2 runs; join/wait read thread values` | `test_run_executor.py` (`TestRunOutputStorage`), `test_run_waiters_output.py` |
 | P6 | History ignored `select`, so SDK discovery reads shipped full values. | `feat(api): honor select on thread history` | `tests/integration/test_api/test_threads_history.py` |
 | P7 | `multitask_strategy: "reject"` was accepted but never applied, so a busy thread started a second run; `input.respond` resumed any well-formed interrupt id, even an answered one. Now `reject` refuses while the thread has a pending or running run: REST run creation answers 409, v2 `run.start` the protocol error `unknown_error` (official parity; the protocol has no conflict code). A thread row lock held until the run commits makes the check race-safe across replicas. `input.respond` to an id not pending on the latest checkpoint answers `no_such_interrupt` and creates no run; while a run is in flight it fails open, as official. `interrupt`, `rollback` and `enqueue` are unchanged: the run starts alongside the active one. | `feat(api)!: honor multitask reject and refuse answers to non-pending interrupts` | `tests/integration/test_api/test_command_semantics_db.py` (needs Postgres), `test_commands.py` (`TestInputRespondPendingInterrupts`, `TestErrors`), `test_event_streaming.py` (`TestCommandRoute`) |
+| P8 | Runs created through REST (and crons) streamed v1 events, so a thread's v2 stream carried two event shapes; the v1 run-stream endpoints read that store. Now `POST /threads/{t}/runs/stream`, `GET /threads/{t}/runs/{r}/stream` and `POST /runs/stream` answer 410 pointing to v2, and every run executes on the v2 path, as after `run.start`. REST create, get, list, cancel, delete, wait and join stay. Run-level `interrupt_before`/`interrupt_after` now reach LangGraph and a breakpoint pause ends the run `interrupted`. | `feat(api)!: retire v1 run-stream endpoints; REST runs use the v2 event path` | `tests/integration/test_api/test_v2_only_streaming.py` (needs a migrated Postgres), `test_native_stream.py` (`test_passes_breakpoints_as_arguments_not_config`), `test_run_executor.py` (`test_breakpoint_pause_reads_pending_tasks`), e2e `test_event_streaming/test_rest_runs_v2_e2e.py` |
 
 P4 (heartbeat, no idle close) is part of P3.
 
 ## Known upstream failures
 
-`tests/integration/test_streaming_errors.py` (3 tests) fails on unmodified
-`v0.11.0` too; not caused by these patches.
+`tests/integration/test_streaming_errors.py` (3 tests) failed on unmodified
+`v0.11.0` too. P8 removed it with the v1 stream it tested; the `--ignore` for
+it in `fb-release.yml` is now a no-op.
 
 ## Rebasing onto a new upstream release
 

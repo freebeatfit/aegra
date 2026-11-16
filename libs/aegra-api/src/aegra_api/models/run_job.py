@@ -39,13 +39,10 @@ class RunExecution(BaseModel):
     input_data: dict[str, Any] | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     context: dict[str, Any] = Field(default_factory=dict)
-    stream_mode: str | list[str] | None = None
     checkpoint: dict[str, Any] | None = None
     command: dict[str, Any] | None = None
     # Resolved at creation (run field, then server default); None keeps LangGraph's default.
     durability: Durability | None = None
-    # When true, stream via the native v3 protocol producer for Agent Protocol v2.
-    event_streaming_v2: bool = False
 
 
 class RunBehavior(BaseModel):
@@ -56,7 +53,6 @@ class RunBehavior(BaseModel):
     interrupt_before: str | list[str] | None = None
     interrupt_after: str | list[str] | None = None
     multitask_strategy: str | None = None
-    subgraphs: bool = False
 
 
 class RunJob(BaseModel):

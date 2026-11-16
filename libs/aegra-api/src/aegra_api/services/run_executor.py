@@ -17,16 +17,13 @@ from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming.native_stream import stream_native_v3_events
-from aegra_api.services.graph_streaming import stream_graph_events
-from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
+from aegra_api.services.langgraph_service import create_run_config, create_thread_config, get_langgraph_service
 from aegra_api.services.run_status import finalize_run, start_run
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
 from aegra_api.utils.run_utils import map_command_to_langgraph
 
 logger = structlog.getLogger(__name__)
-
-_DEFAULT_STREAM_MODES = ["values"]
 
 # Cancellation provenance prevents infrastructure stops from looking user-initiated.
 _lease_loss_cancellations: set[str] = set()
@@ -55,10 +52,9 @@ async def execute_run(job: RunJob) -> None:
             return
 
         final_output = await _stream_graph(job)
-        # A v2 run's state lives in its checkpoint; the LangGraph Agent Server
+        # A run's state lives in its checkpoint; the LangGraph Agent Server
         # stores no run output and join/wait read the thread's values on demand
-        # (run_waiters). Keeping the last full state per run duplicated it.
-        stored_output = None if job.execution.event_streaming_v2 else final_output.data
+        # (run_waiters).
 
         if final_output.has_interrupt:
             finalized = await finalize_run(
@@ -67,7 +63,7 @@ async def execute_run(job: RunJob) -> None:
                 user_id=user_id,
                 status="interrupted",
                 thread_status="interrupted",
-                output=stored_output,
+                output=None,
             )
         else:
             finalized = await finalize_run(
@@ -76,7 +72,7 @@ async def execute_run(job: RunJob) -> None:
                 user_id=user_id,
                 status="success",
                 thread_status="idle",
-                output=stored_output,
+                output=None,
             )
 
     except asyncio.CancelledError:
@@ -163,20 +159,18 @@ async def _best_effort_signal(fn: Any, *args: Any) -> None:
 
 
 class _GraphResult:
-    """Accumulates output and interrupt state during graph streaming."""
+    """Interrupt state accumulated during graph streaming."""
 
-    __slots__ = ("data", "has_interrupt")
+    __slots__ = ("has_interrupt",)
 
     def __init__(self) -> None:
-        self.data: dict[str, Any] = {}
         self.has_interrupt: bool = False
 
 
 async def _stream_graph(job: RunJob) -> _GraphResult:
-    """Load the graph, stream events to the broker, return final output."""
+    """Load the graph, stream its v2 events to the broker, return its interrupt state."""
     run_config = _build_run_config(job)
     execution_input = _resolve_input(job)
-    stream_modes = _resolve_stream_modes(job.execution.stream_mode)
 
     langgraph_service = get_langgraph_service()
     result = _GraphResult()
@@ -191,42 +185,9 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
         ) as graph,
         with_auth_ctx(job.user, job.user.permissions),  # type: ignore[arg-type]
     ):
-        if job.execution.event_streaming_v2:
-            await _stream_native_v2(job, graph, execution_input, run_config, result)
-        else:
-            await _stream_legacy(job, graph, execution_input, run_config, stream_modes, result)
+        await _stream_native_v2(job, graph, execution_input, run_config, result)
 
     return result
-
-
-async def _stream_legacy(
-    job: RunJob,
-    graph: Any,
-    execution_input: Any,
-    run_config: dict[str, Any],
-    stream_modes: list[str],
-    result: _GraphResult,
-) -> None:
-    """Stream via the v1 producer (legacy SSE endpoints)."""
-    run_id = job.identity.run_id
-    async for event_type, event_data in stream_graph_events(
-        graph=graph,
-        input_data=execution_input,
-        config=run_config,
-        stream_mode=stream_modes,
-        context=job.execution.context,
-        subgraphs=job.behavior.subgraphs,
-        durability=job.execution.durability,
-        on_checkpoint=lambda _: None,
-        on_task_result=lambda _: None,
-    ):
-        event_id = await broker_manager.allocate_event_id(run_id)
-        await streaming_service.put_to_broker(run_id, event_id, (event_type, event_data))
-
-        if isinstance(event_data, dict) and "__interrupt__" in event_data:
-            result.has_interrupt = True
-        if event_type.startswith("values"):
-            result.data = event_data
 
 
 async def _stream_native_v2(
@@ -238,9 +199,9 @@ async def _stream_native_v2(
 ) -> None:
     """Stream via the native v3 protocol producer (Agent Protocol v2).
 
-    Each native event goes into the broker as ``(method, protocol_event)``.
-    Interrupts ride on a ``values`` event's ``params.interrupts``; the final
-    state is the last ``values`` event's ``params.data``.
+    Every run streams this way, whichever route created it. Each native event
+    goes into the broker as ``(method, protocol_event)``; interrupts ride on a
+    ``values`` event's ``params.interrupts``.
     """
     run_id = job.identity.run_id
     async for method, event in stream_native_v3_events(
@@ -259,6 +220,12 @@ async def _stream_native_v2(
         # in a values/updates payload (the path session.py routes to input.requested).
         if params.get("interrupts") or (isinstance(data, dict) and "__interrupt__" in data):
             result.has_interrupt = True
+
+    # A breakpoint pauses the run without an interrupt event; its pending task shows in the state.
+    # ponytail: run-level breakpoints only; breakpoints compiled into the graph need the same check.
+    if not result.has_interrupt and (job.behavior.interrupt_before or job.behavior.interrupt_after):
+        snapshot = await graph.aget_state(create_thread_config(job.identity.thread_id, job.user))
+        result.has_interrupt = bool(snapshot.next)
 
 
 def _build_run_config(job: RunJob) -> dict[str, Any]:
@@ -284,15 +251,6 @@ def _resolve_input(job: RunJob) -> Any:
     if job.execution.command is not None:
         return map_command_to_langgraph(job.execution.command)
     return job.execution.input_data
-
-
-def _resolve_stream_modes(stream_mode: str | list[str] | None) -> list[str]:
-    """Normalize stream_mode to a list."""
-    if stream_mode is None:
-        return _DEFAULT_STREAM_MODES.copy()
-    if isinstance(stream_mode, str):
-        return [stream_mode]
-    return list(stream_mode)
 
 
 # ------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """End-to-end coverage for terminal run and thread reconciliation."""
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -158,12 +159,16 @@ async def _wait_for_end_event(
     timeout = httpx.Timeout(10.0, read=None)
     async with (
         httpx.AsyncClient(base_url=settings.app.SERVER_URL, timeout=timeout) as client,
-        client.stream("GET", f"/threads/{thread_id}/runs/{run_id}/stream") as response,
+        client.stream("POST", f"/threads/{thread_id}/stream/events", json={"channels": ["lifecycle"]}) as response,
     ):
         response.raise_for_status()
         stream_started.set()
         async for line in response.aiter_lines():
-            if line.strip() == "event: end":
+            if not line.startswith("data: "):
+                continue
+            event = json.loads(line.removeprefix("data: "))
+            # The run's root lifecycle terminal: synth:<run_id>:end|error.
+            if event["event_id"].startswith(f"synth:{run_id}:") and event["params"]["data"]["event"] != "running":
                 return "end"
     return "closed"
 

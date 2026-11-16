@@ -32,6 +32,12 @@ _METADATA_MAX_VALUE_LEN = 512
 Durability = Literal["sync", "async", "exit"]
 
 
+# Fields the retired v1 run-stream endpoints read; the SDK still sends them.
+_V1_STREAM_FIELD = (
+    "Ignored: every run streams on the Agent Protocol v2 thread stream (POST /threads/{thread_id}/stream/events)."
+)
+
+
 class RunCreate(BaseModel):
     """Request model for creating runs"""
 
@@ -62,12 +68,9 @@ class RunCreate(BaseModel):
         None,
         description="Deprecated alias for durability: true means 'async', false means 'exit'. 'durability' wins if both are set.",
     )
-    stream: bool = Field(False, description="Enable streaming response")
-    stream_mode: str | list[str] | None = Field(None, description="Requested stream mode(s)")
-    on_disconnect: str | None = Field(
-        None,
-        description="Behavior on client disconnect: 'cancel' (default) or 'continue'.",
-    )
+    stream: bool = Field(False, description=_V1_STREAM_FIELD)
+    stream_mode: str | list[str] | None = Field(None, description=_V1_STREAM_FIELD)
+    on_disconnect: str | None = Field(None, description=_V1_STREAM_FIELD)
     on_completion: Literal["delete", "keep"] | None = Field(
         None,
         description="Behavior after stateless run completes: 'delete' (default) removes the ephemeral thread, 'keep' preserves it.",
@@ -92,11 +95,7 @@ class RunCreate(BaseModel):
         description="Nodes to interrupt immediately after they get executed. Use '*' for all nodes.",
     )
 
-    # Subgraph configuration
-    stream_subgraphs: bool | None = Field(
-        False,
-        description="Whether to include subgraph events in streaming. When True, includes events from all subgraphs. When False (default when None), excludes subgraph events. Defaults to False for backwards compatibility.",
-    )
+    stream_subgraphs: bool | None = Field(False, description=_V1_STREAM_FIELD)
 
     # Request metadata (top-level in payload).  Reaches OTEL trace
     # attributes as ``langfuse.trace.metadata.<key>`` (and the

@@ -1,7 +1,7 @@
 """E2E tests for stateless (thread-free) run endpoints.
 
-These tests hit a real running Aegra server and exercise the ``POST /runs/wait``,
-``POST /runs/stream``, and ``POST /runs`` endpoints that accept no thread_id.
+These tests hit a real running Aegra server and exercise the ``POST /runs/wait``
+and ``POST /runs`` endpoints that accept no thread_id; ``POST /runs/stream`` is retired (410).
 
 Requirements:
   - A running Aegra server (``uv run aegra dev`` or ``docker compose up``)
@@ -105,83 +105,19 @@ async def test_stateless_wait_keep_preserves_thread() -> None:
 
 
 # ---------------------------------------------------------------------------
-# POST /runs/stream  (stateless stream)
+# POST /runs/stream  (retired: streaming is Agent Protocol v2 only)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_stateless_stream_returns_sse_events() -> None:
-    """POST /runs/stream returns a valid SSE stream."""
-    sdk = get_e2e_client()
+async def test_stateless_stream_is_gone() -> None:
+    """POST /runs/stream answers 410 with a pointer to the v2 thread stream."""
+    async with AsyncClient(base_url=settings.app.SERVER_URL, timeout=10.0) as http:
+        resp = await http.post("/runs/stream", json={"assistant_id": "agent", "input": {"messages": []}})
 
-    assistant = await sdk.assistants.create(
-        graph_id="agent",
-        config={"tags": ["stateless", "stream"]},
-        if_exists="do_nothing",
-    )
-    assistant_id = assistant["assistant_id"]
-
-    async with (
-        AsyncClient(base_url=settings.app.SERVER_URL, timeout=120.0) as http,
-        http.stream(
-            "POST",
-            "/runs/stream",
-            json={
-                "assistant_id": assistant_id,
-                "input": {"messages": [{"role": "user", "content": "Say hello in one word."}]},
-            },
-        ) as resp,
-    ):
-        assert resp.status_code == 200
-        assert "text/event-stream" in resp.headers.get("content-type", "")
-
-        event_count = 0
-        async for line in resp.aiter_lines():
-            if line.startswith("event:") or line.startswith("data:"):
-                event_count += 1
-            if event_count >= 3:
-                break  # enough to prove streaming works
-
-        elog("POST /runs/stream", {"events_seen": event_count})
-        assert event_count > 0, "Expected at least one SSE event"
-
-
-@pytest.mark.e2e
-@pytest.mark.asyncio
-async def test_stateless_stream_with_keep() -> None:
-    """POST /runs/stream with on_completion='keep' still streams correctly."""
-    sdk = get_e2e_client()
-
-    assistant = await sdk.assistants.create(
-        graph_id="agent",
-        config={"tags": ["stateless", "stream-keep"]},
-        if_exists="do_nothing",
-    )
-    assistant_id = assistant["assistant_id"]
-
-    async with (
-        AsyncClient(base_url=settings.app.SERVER_URL, timeout=120.0) as http,
-        http.stream(
-            "POST",
-            "/runs/stream",
-            json={
-                "assistant_id": assistant_id,
-                "input": {"messages": [{"role": "user", "content": "Say hi."}]},
-                "on_completion": "keep",
-            },
-        ) as resp,
-    ):
-        assert resp.status_code == 200
-
-        event_count = 0
-        async for line in resp.aiter_lines():
-            if line.startswith("event:") or line.startswith("data:"):
-                event_count += 1
-            if event_count >= 3:
-                break
-
-        assert event_count > 0
+    assert resp.status_code == 410
+    assert resp.json()["details"]["stream"] == "POST /threads/{thread_id}/stream/events"
 
 
 # ---------------------------------------------------------------------------

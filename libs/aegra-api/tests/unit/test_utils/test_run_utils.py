@@ -1,4 +1,3 @@
-import pytest
 from langgraph.types import Send
 
 from aegra_api.utils.run_utils import map_command_to_langgraph
@@ -24,66 +23,6 @@ def test_merge_jsonb_and_should_skip_event():
     # Other shapes should not be skipped
     assert _should_skip_event(("values", {"foo": "bar"})) is False
     assert _should_skip_event("just-a-string") is False
-
-
-class DummyLogger:
-    def __init__(self):
-        self.calls = []
-
-    async def adebug(self, *args, **kwargs):
-        self.calls.append((args, kwargs))
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_filter_no_schema_returns_same():
-    from aegra_api.utils import run_utils
-
-    dummy = DummyLogger()
-    # inject dummy logger to capture adebug
-    run_utils.logger = dummy
-
-    context = {"a": 1}
-    result = await run_utils._filter_context_by_schema(context, None)
-    # should return the context unchanged when no schema provided
-    assert result is context
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_filter_with_schema_filters_keys():
-    from aegra_api.utils import run_utils
-
-    dummy = DummyLogger()
-    run_utils.logger = dummy
-
-    context = {"a": 1, "b": 2}
-    schema = {"properties": {"a": {}}}
-
-    filtered = await run_utils._filter_context_by_schema(context, schema)
-    assert filtered == {"a": 1}
-
-    # ensure adebug was called for the filtered-out key
-    assert len(dummy.calls) == 1
-    _, kw = dummy.calls[0]
-    assert kw.get("context_key") == "b"
-    assert "available_keys" in kw
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_filter_with_empty_properties_returns_context():
-    from aegra_api.utils import run_utils
-
-    dummy = DummyLogger()
-    run_utils.logger = dummy
-
-    context = {"a": 1}
-    schema = {"properties": {}}
-
-    result = await run_utils._filter_context_by_schema(context, schema)
-    # no properties defined -> do not filter
-    assert result == context
 
 
 class TestMapCommandToLangGraph:

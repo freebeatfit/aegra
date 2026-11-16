@@ -9,10 +9,13 @@ Addresses GitHub Issue #132: Cancel endpoint doesn't cancel asyncio task
 """
 
 import asyncio
+import json
 
+import httpx
 import pytest
 from langgraph_sdk.client import LangGraphClient
 
+from aegra_api.settings import settings
 from tests.e2e._utils import check_and_skip_if_geo_blocked, elog, get_e2e_client
 
 
@@ -45,8 +48,8 @@ async def test_cancel_stops_event_stream():
     thread_id = thread["thread_id"]
     elog("Thread.create", {"thread_id": thread_id})
 
-    # Start a streaming run with a prompt that should generate a long response
-    stream = client.runs.stream(
+    # Start a run with a prompt that should generate a long response
+    run = await client.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id,
         input={
@@ -60,35 +63,24 @@ async def test_cancel_stops_event_stream():
                 }
             ]
         },
-        stream_mode=["messages", "values"],
     )
+    run_id = run["run_id"]
+    check_and_skip_if_geo_blocked(run)
 
-    # Collect events until we have a few, then cancel
-    events_before_cancel = []
-    run_id = None
-
-    async for chunk in stream:
-        event_type = getattr(chunk, "event", None)
-        events_before_cancel.append(chunk)
-        elog(
-            f"Event {len(events_before_cancel)}",
-            {
-                "event": event_type,
-                "data_type": type(getattr(chunk, "data", None)).__name__,
-            },
-        )
-
-        # After receiving some events, find run_id and cancel
-        if len(events_before_cancel) >= 3 and run_id is None:
-            runs_list = await client.runs.list(thread_id)
-            if runs_list:
-                run_id = runs_list[0]["run_id"]
-                check_and_skip_if_geo_blocked(runs_list[0])
-                elog("Found run_id", {"run_id": run_id})
+    # Collect a few events from the v2 thread stream, then cancel
+    events_before_cancel: list[str] = []
+    async with (
+        httpx.AsyncClient(base_url=settings.app.SERVER_URL or "", timeout=60.0) as http,
+        http.stream(
+            "POST", f"/threads/{thread_id}/stream/events", json={"channels": ["messages", "values", "lifecycle"]}
+        ) as response,
+    ):
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                events_before_cancel.append(json.loads(line.removeprefix("data: "))["method"])
+            if len(events_before_cancel) >= 3:
                 break
-
-    if run_id is None:
-        pytest.skip("Could not find run_id to cancel")
+    elog("Events before cancel", events_before_cancel)
 
     # Cancel the run
     elog("Cancelling run", {"run_id": run_id})

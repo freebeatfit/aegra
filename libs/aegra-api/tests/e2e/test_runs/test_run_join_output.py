@@ -7,19 +7,16 @@ from tests.e2e._utils import elog, get_e2e_client
 @pytest.mark.asyncio
 async def test_run_join_returns_actual_output():
     """
-    Test that the join endpoint returns actual run output instead of empty dict.
+    Test that the join endpoint returns the run's result instead of an empty dict.
 
-    This test validates the fix where final_output was being captured correctly
-    but then ignored when saving to database (hardcoded as output={}).
-
-    Before fix: join always returned {}
-    After fix: join returns the actual graph execution output
+    A run stores no copy of its final state (runs.output is null, as in the
+    LangGraph Agent Server); join answers from the thread's current values.
     """
     client = get_e2e_client()
 
     # Create assistant
     assistant = await client.assistants.create(
-        graph_id="agent",
+        graph_id="stress_test",
         config={"tags": ["join-output-test"]},
         if_exists="do_nothing",
     )
@@ -35,8 +32,7 @@ async def test_run_join_returns_actual_output():
     run = await client.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id,
-        input={"messages": [{"role": "user", "content": "Say hello"}]},
-        stream_mode=["values"],  # Request values mode to capture final output
+        input={"messages": [{"role": "user", "content": '{"delay": 0.1, "steps": 1}'}]},
     )
     elog("Runs.create", run)
     run_id = run["run_id"]
@@ -57,14 +53,14 @@ async def test_run_join_returns_actual_output():
     elog("Runs.get details", run_details)
 
     assert run_details["status"] == "success", f"Expected success status, got {run_details['status']}"
-    assert run_details["output"] is not None, "Run output should not be None in database"
-    assert run_details["output"] != {}, "Run output should not be empty dict in database"
+    assert run_details["output"] is None, "The run should store no copy of the final state"
 
-    # Verify join and get return the same output
-    assert final_output == run_details["output"], "Join output should match stored run output"
+    # Join answers from the thread's current values
+    state = await client.threads.get_state(thread_id)
+    assert final_output == state["values"], "Join output should match the thread's values"
 
     elog(
-        "✅ Test passed - join now returns actual output instead of empty dict!",
+        "Join returned the thread values",
         {
             "output_type": type(final_output).__name__,
             "output_empty": final_output == {},

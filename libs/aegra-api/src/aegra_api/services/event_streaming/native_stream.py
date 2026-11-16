@@ -4,9 +4,8 @@
 ``{type:"event", method, params:{data, namespace, ...}}`` — including the
 content-block message lifecycle, tool-call blocks, token usage, and
 ``params.interrupts``. We forward those into the broker verbatim; the
-session restamps seq/event_id and filters by channel. This is the v2
-counterpart to the legacy ``stream_graph_events`` (v1) producer and does
-not touch it.
+session restamps seq/event_id and filters by channel. Every run streams
+through here, whichever route created it.
 
 The only reshaping here: ``messages`` events arrive as ``[event, metadata]``
 tuples, so we unwrap element 0 into ``params.data``.
@@ -127,8 +126,15 @@ async def stream_native_v3_events(
     """
     # v3 forwards extra kwargs to astream; omitted when unset to keep LangGraph's default.
     durability_kwargs: dict[str, Durability] = {"durability": durability} if durability is not None else {}
+    config, breakpoints = _split_breakpoints(config)
     run_stream = await graph.astream_events(
-        input_data, config, version="v3", context=context, transformers=_extra_transformers(), **durability_kwargs
+        input_data,
+        config,
+        version="v3",
+        context=context,
+        transformers=_extra_transformers(),
+        **breakpoints,
+        **durability_kwargs,
     )
     # LangGraph Python emits a step's values, then that step's checkpoint. The
     # protocol (and LangGraph JS) put the envelope immediately before its
@@ -163,6 +169,20 @@ async def stream_native_v3_events(
             yield method, event
     if held is not None:
         yield held
+
+
+def _split_breakpoints(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Move ``interrupt_before``/``interrupt_after`` out of the config into stream kwargs.
+
+    LangGraph reads breakpoints only as arguments; in the config they are ignored.
+    """
+    config = dict(config)
+    breakpoints: dict[str, Any] = {}
+    for key in ("interrupt_before", "interrupt_after"):
+        value = config.pop(key, None)
+        if value is not None:
+            breakpoints[key] = "*" if value == ["*"] else value
+    return config, breakpoints
 
 
 def _namespace(event: dict[str, Any]) -> list[Any]:

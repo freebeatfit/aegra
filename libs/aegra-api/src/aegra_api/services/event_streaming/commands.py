@@ -370,8 +370,6 @@ async def _thread_assistant_id(session: AsyncSession, thread_id: str, user: User
 
 
 async def _start(session: AsyncSession, thread_id: str, request: RunCreate, user: User) -> str:
-    """Persist + enqueue a run via the shared preparation path (native v3 stream)."""
-    run_id, _run, _job = await _prepare_run(
-        session, thread_id, request, user, initial_status="pending", event_streaming_v2=True
-    )
+    """Persist + enqueue a run via the shared preparation path."""
+    run_id, _run, _job = await _prepare_run(session, thread_id, request, user, initial_status="pending")
     return run_id

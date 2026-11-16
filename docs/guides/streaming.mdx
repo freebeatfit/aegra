@@ -5,6 +5,10 @@ description: "Stream agent responses in real time with Server-Sent Events."
 
 Aegra streams agent execution to clients using Server-Sent Events (SSE). This gives you real-time token-by-token output, tool call updates, and state changes as they happen.
 
+<Warning>
+  Freebeat fork: streaming is [Agent Protocol v2](#agent-protocol-v2-event-streaming) only. The v1 run-stream endpoints (`POST /threads/{thread_id}/runs/stream`, `GET /threads/{thread_id}/runs/{run_id}/stream`, `POST /runs/stream`) answer `410 Gone`, and every run, including one created through the REST run endpoints, streams its events on `POST /threads/{thread_id}/stream/events`. The v1 sections below describe upstream Aegra.
+</Warning>
+
 ## Quick example
 
 ```python
@@ -291,7 +295,7 @@ Events are retained for 10 minutes after the run completes, in both dev and prod
 The latest LangGraph JS and Python SDKs (including `@langchain/langgraph-sdk` and the Vue/React `useStream()` composables) speak a newer streaming protocol with a dedicated event envelope and a content-block message model. Aegra serves this protocol natively.
 
 <Note>
-  v2 streaming is **on by default** — it's a new endpoint set the SDK targets and has no v1 to break; the legacy `runs/stream` endpoints are unchanged. `FF_V2_EVENT_STREAMING` is a kill switch: set it to `false` to disable v2 serving (requests return `503` with an enable hint) and roll back without a redeploy. The endpoints also require a `langgraph` / `langchain-core` new enough to emit native v3 events; the server returns `503` with an upgrade hint if the runtime is too old.
+  v2 streaming is **on by default** and, in this fork, the only streaming there is: the legacy `runs/stream` endpoints answer `410 Gone`. `FF_V2_EVENT_STREAMING` is a kill switch: set it to `false` to disable v2 serving (requests return `503` with an enable hint) and roll back without a redeploy. The endpoints also require a `langgraph` / `langchain-core` new enough to emit native v3 events; the server returns `503` with an upgrade hint if the runtime is too old.
 </Note>
 
 ### Using the SDK

@@ -269,9 +269,8 @@ async def _prepare_run(
     user: User,
     *,
     initial_status: str,
-    event_streaming_v2: bool = False,
 ) -> tuple[str, Run, RunJob]:
-    """Shared run-creation logic used by create, stream, and wait endpoints.
+    """Shared run-creation logic used by the run routes, crons and v2 commands.
 
     Validates inputs, resolves the assistant, persists the RunORM record,
     builds a RunJob, submits it to the executor, and returns the triple
@@ -337,17 +336,14 @@ async def _prepare_run(
             input_data=request.input,  # preserve None so LangGraph resumes from checkpoint
             config=config,
             context=context,
-            stream_mode=request.stream_mode,
             checkpoint=_resolve_checkpoint(request),
             command=request.command,
             durability=_resolve_durability(request),
-            event_streaming_v2=event_streaming_v2,
         ),
         behavior=RunBehavior(
             interrupt_before=request.interrupt_before,
             interrupt_after=request.interrupt_after,
             multitask_strategy=request.multitask_strategy,
-            subgraphs=request.stream_subgraphs or False,
         ),
         run_metadata=request.metadata or {},
     )

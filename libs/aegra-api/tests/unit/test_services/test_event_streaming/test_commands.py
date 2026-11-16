@@ -62,8 +62,6 @@ class TestRunStart:
         assert request.input == {"x": 1}
         assert request.config == {"c": 2}
         assert request.context == {"tenant_id": "acme"}
-        # v2 runs are flagged for the native v3 stream path.
-        assert prepared_run.call_args.kwargs["event_streaming_v2"] is True
 
     async def test_run_start_forwards_interrupt_breakpoints(self, prepared_run: AsyncMock, user: User) -> None:
         """interrupt_before/after must reach RunCreate so v2 clients can set HITL breakpoints."""

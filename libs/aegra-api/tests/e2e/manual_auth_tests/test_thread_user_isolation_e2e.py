@@ -183,17 +183,14 @@ class TestThreadMutationIsolation:
 
     @pytest.mark.asyncio
     async def test_other_user_cannot_stream_run_on_thread(self) -> None:
-        """POST /threads/<id>/runs/stream returns 404 when a different user attempts to stream a run."""
+        """POST /threads/<id>/stream/events returns 404 when a different user attempts to stream the thread."""
         alice_client = get_client_with_auth("alice")
         thread = await alice_client.threads.create(metadata={"isolation_test": "stream-run"})
         thread_id = thread["thread_id"]
 
         bob_headers = get_auth_headers("bob")
         async with httpx.AsyncClient(base_url=get_server_url(), headers=bob_headers, timeout=30.0) as http:
-            resp = await http.post(
-                f"/threads/{thread_id}/runs/stream",
-                json={"assistant_id": "agent", "input": {"messages": [{"role": "human", "content": "hi"}]}},
-            )
+            resp = await http.post(f"/threads/{thread_id}/stream/events", json={"channels": ["lifecycle"]})
         elog("Bob POST stream run to Alice's thread", {"status": resp.status_code})
         assert resp.status_code == 404, (
             f"Expected 404 when bob streams against alice's thread, got {resp.status_code}: {resp.text}"

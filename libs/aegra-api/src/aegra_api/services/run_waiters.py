@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
+from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.services.executor import executor
 from aegra_api.settings import settings
 
@@ -122,9 +123,12 @@ async def thread_values_for(run_orm: RunORM | None, user: Any) -> dict[str, Any]
         return None
 
 
+_serializer = GeneralSerializer()
+
+
 def encode_output(output: dict[str, Any]) -> bytes:
-    """Serialize a run output dict to JSON bytes."""
-    return json.dumps(output, default=str).encode()
+    """Serialize a run result to JSON bytes; thread values carry message objects."""
+    return json.dumps(output, default=_serializer.serialize).encode()
 
 
 async def heartbeat_wait_body(

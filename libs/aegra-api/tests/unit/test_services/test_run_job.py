@@ -26,7 +26,6 @@ class TestRunExecution:
         assert execution.input_data is None
         assert execution.config == {}
         assert execution.context == {}
-        assert execution.stream_mode is None
         assert execution.checkpoint is None
         assert execution.command is None
 
@@ -34,11 +33,9 @@ class TestRunExecution:
         execution = RunExecution(
             input_data={"key": "value"},
             config={"configurable": {}},
-            stream_mode=["values", "updates"],
             command={"resume": True},
         )
         assert execution.input_data == {"key": "value"}
-        assert execution.stream_mode == ["values", "updates"]
         assert execution.command == {"resume": True}
 
     def test_durability_defaults_to_none(self) -> None:
@@ -55,7 +52,6 @@ class TestRunBehavior:
         assert behavior.interrupt_before is None
         assert behavior.interrupt_after is None
         assert behavior.multitask_strategy is None
-        assert behavior.subgraphs is False
 
 
 class TestRunJob:
@@ -68,14 +64,12 @@ class TestRunJob:
                 input_data={"message": "hello"},
                 config={"configurable": {"model": "gpt-4"}},
                 context={"tenant": "acme"},
-                stream_mode="values",
                 checkpoint={"thread_ts": "123"},
                 command=None,
             ),
             behavior=RunBehavior(
                 interrupt_before=["review"],
                 interrupt_after=None,
-                subgraphs=True,
             ),
         )
 
@@ -129,8 +123,25 @@ class TestRunJob:
             user=User(identity="u1"),
         )
         assert job.execution.input_data is None
-        assert job.behavior.subgraphs is False
         assert job.run_metadata == {}
+
+    def test_loads_rows_persisted_with_v1_stream_fields(self) -> None:
+        """Rows written before streaming went v2-only still reconstruct, so the reaper can recover them."""
+
+        class FakeORM:
+            run_id = "r1"
+            thread_id = "t1"
+            execution_params = {
+                "graph_id": "g1",
+                "user": {"identity": "u1"},
+                "execution": {"input_data": {"m": 1}, "stream_mode": ["values"], "event_streaming_v2": False},
+                "behavior": {"subgraphs": True},
+            }
+
+        job = RunJob.from_run_orm(FakeORM())
+
+        assert job.execution.input_data == {"m": 1}
+        assert "event_streaming_v2" not in job.execution.model_dump()
 
     def test_run_metadata_roundtrip(self) -> None:
         """run_metadata round-trips through to_execution_params / from_run_orm."""

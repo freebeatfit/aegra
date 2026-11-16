@@ -2,16 +2,13 @@
 
 import asyncio
 import contextlib
-from collections.abc import AsyncGenerator, MutableMapping
-from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from redis import RedisError
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sse_starlette import EventSourceResponse
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
@@ -19,11 +16,9 @@ from aegra_api.core.auth_handlers import build_auth_context, handle_event
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker, get_session
-from aegra_api.core.sse import create_end_event, get_sse_headers, make_sse_response, sse_to_bytes
 from aegra_api.models import Run, RunCreate, RunsCancel, RunStatus, User
 from aegra_api.models.enums import RunCancellationAction
-from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
-from aegra_api.services.broker import broker_manager
+from aegra_api.models.errors import CONFLICT, NOT_FOUND, AgentProtocolError
 from aegra_api.services.run_preparation import _prepare_run
 from aegra_api.services.run_status import interrupt_unowned_run
 from aegra_api.services.run_waiters import (
@@ -41,11 +36,16 @@ router = APIRouter(tags=["Thread Runs"], dependencies=auth_dependency)
 
 logger = structlog.getLogger(__name__)
 
-
-# active_runs is imported from aegra_api.core.active_runs (dependency-free module)
-
-# Default stream modes for background run execution
-DEFAULT_STREAM_MODES = ["values"]
+# Every run streams on the Agent Protocol v2 thread stream; the v1 run-stream routes stay only to say so.
+V1_STREAMING_GONE = AgentProtocolError(
+    error="gone",
+    message="v1 run streaming is retired. Start runs with POST /threads/{thread_id}/commands "
+    "(or the REST run routes) and read events from POST /threads/{thread_id}/stream/events.",
+    details={
+        "commands": "POST /threads/{thread_id}/commands",
+        "stream": "POST /threads/{thread_id}/stream/events",
+    },
+)
 
 
 async def _request_run_interruption(
@@ -124,9 +124,10 @@ async def create_run(
     """Create and execute a new run.
 
     Starts graph execution asynchronously and returns the run record
-    immediately with status `pending`. Poll the run or use the stream
-    endpoint to follow progress. Provide either `input` or `command` (for
-    human-in-the-loop resumption) but not both.
+    immediately with status `pending`. Poll or join the run, or follow its
+    events on the thread's v2 stream (`POST /threads/{thread_id}/stream/events`).
+    Provide either `input` or `command` (for human-in-the-loop resumption)
+    but not both.
     """
     existing_thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
     if existing_thread and existing_thread.user_id != user.identity:
@@ -139,62 +140,10 @@ async def create_run(
     return run
 
 
-@router.post("/threads/{thread_id}/runs/stream", responses={**SSE_RESPONSE, **NOT_FOUND, **CONFLICT})
-async def create_and_stream_run(
-    thread_id: str,
-    request: RunCreate,
-    user: User = Depends(get_current_user),
-) -> EventSourceResponse:
-    """Create a new run and stream its execution via SSE.
-
-    Returns a `text/event-stream` response with Server-Sent Events. Each
-    event has a `type` field (e.g. `values`, `updates`, `messages`,
-    `metadata`, `end`) and a JSON `data` payload.
-
-    Set `on_disconnect` to `"continue"` if the run should keep executing
-    after the client disconnects (default is `"cancel"`). Use `stream_mode`
-    to control which event types are emitted.
-
-    A periodic SSE keepalive comment is sent every
-    ``KEEPALIVE_INTERVAL_SECS`` so idle proxies don't drop long-running
-    silent nodes (e.g. agents holding an upstream WebSocket).
-    """
-    maker = _get_session_maker()
-    async with maker() as session:
-        existing_thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
-        if existing_thread and existing_thread.user_id != user.identity:
-            raise HTTPException(404, f"Thread '{thread_id}' not found")
-
-        await _apply_create_run_auth(user, thread_id, request)
-
-        run_id, run, _job = await _prepare_run(session, thread_id, request, user, initial_status="pending")
-
-    # Default to cancel on disconnect - this matches user expectation that clicking
-    # "Cancel" in the frontend will stop the backend task. Users can explicitly
-    # set on_disconnect="continue" if they want the task to continue.
-    cancel_on_disconnect = (request.on_disconnect or "cancel").lower() == "cancel"
-
-    async def _cancel_on_client_close(_msg: MutableMapping[str, Any]) -> None:
-        try:
-            await broker_manager.request_cancel(run_id, "cancel")
-        except (RedisError, OSError):
-            # Swallow infra/transport failures so sse-starlette's task group
-            # tears down cleanly. Programmer errors (TypeError, AttributeError,
-            # ...) propagate. The lease reaper picks up unreachable runs.
-            # OSError covers ConnectionError/TimeoutError (3.11+ subclasses).
-            logger.exception("Failed to cancel run on client disconnect", run_id=run_id)
-
-    close_handler = _cancel_on_client_close if cancel_on_disconnect else None
-
-    return make_sse_response(
-        sse_to_bytes(streaming_service.stream_run_execution(run, None)),
-        close_handler=close_handler,
-        headers={
-            **get_sse_headers(),
-            "Location": f"/threads/{thread_id}/runs/{run_id}/stream",
-            "Content-Location": f"/threads/{thread_id}/runs/{run_id}",
-        },
-    )
+@router.post("/threads/{thread_id}/runs/stream", status_code=410, response_model=AgentProtocolError, deprecated=True)
+async def create_and_stream_run(thread_id: str) -> AgentProtocolError:
+    """Retired: use Agent Protocol v2 (`POST /threads/{thread_id}/commands`, then `/stream/events`)."""
+    return V1_STREAMING_GONE
 
 
 @router.get("/threads/{thread_id}/runs/{run_id}", response_model=Run, responses={**NOT_FOUND})
@@ -422,72 +371,12 @@ async def wait_for_run(
     )
 
 
-@router.get("/threads/{thread_id}/runs/{run_id}/stream", responses={**SSE_RESPONSE, **NOT_FOUND})
-async def stream_run(
-    thread_id: str,
-    run_id: str,
-    last_event_id: str | None = Header(None, alias="Last-Event-ID"),
-    _stream_mode: str | None = Query(None, description="Override the stream mode for this connection."),
-    user: User = Depends(get_current_user),
-) -> EventSourceResponse:
-    """Stream an existing run's execution via SSE.
-
-    Attach to a run that was created without streaming (e.g. via the create
-    endpoint) to receive its events in real time. If the run has already
-    finished, a single `end` event is emitted. Use the `Last-Event-ID`
-    header to resume from a specific event after a disconnect.
-
-    A periodic SSE keepalive comment is sent every
-    ``KEEPALIVE_INTERVAL_SECS`` so idle proxies don't drop attached streams.
-    """
-    maker = _get_session_maker()
-    async with maker() as session:
-        logger.info(f"[stream_run] fetch for stream run_id={run_id} thread_id={thread_id} user={user.identity}")
-        run_orm = await session.scalar(
-            select(RunORM).where(
-                RunORM.run_id == str(run_id),
-                RunORM.thread_id == thread_id,
-                RunORM.user_id == user.identity,
-            )
-        )
-        if not run_orm:
-            raise HTTPException(404, f"Run '{run_id}' not found")
-
-        logger.info(f"[stream_run] status={run_orm.status} user={user.identity} thread_id={thread_id} run_id={run_id}")
-        run_status = run_orm.status
-        run_model = Run.model_validate(run_orm)
-    # No client_close_handler_callable: this is a reconnect-style endpoint, so
-    # a single client disconnecting must not cancel the shared run — other
-    # consumers may still be attached via /join or another /stream.
-    # If already terminal and no Last-Event-ID, just emit end.
-    # If Last-Event-ID is present, fall through to stream_run_execution
-    # which will replay missed events from the buffer before ending.
-    if run_status in TERMINAL_STATES and not last_event_id:
-        final_status = "error" if run_status == "error" else run_status
-
-        async def generate_final() -> AsyncGenerator[str, None]:
-            yield create_end_event(status=final_status)
-
-        logger.info(f"[stream_run] starting terminal stream run_id={run_id} status={run_status}")
-        return make_sse_response(
-            sse_to_bytes(generate_final()),
-            headers={
-                **get_sse_headers(),
-                "Location": f"/threads/{thread_id}/runs/{run_id}/stream",
-                "Content-Location": f"/threads/{thread_id}/runs/{run_id}",
-            },
-        )
-
-    # Stream active or pending runs via broker
-
-    return make_sse_response(
-        sse_to_bytes(streaming_service.stream_run_execution(run_model, last_event_id)),
-        headers={
-            **get_sse_headers(),
-            "Location": f"/threads/{thread_id}/runs/{run_id}/stream",
-            "Content-Location": f"/threads/{thread_id}/runs/{run_id}",
-        },
-    )
+@router.get(
+    "/threads/{thread_id}/runs/{run_id}/stream", status_code=410, response_model=AgentProtocolError, deprecated=True
+)
+async def stream_run(thread_id: str, run_id: str) -> AgentProtocolError:
+    """Retired: use Agent Protocol v2 (`POST /threads/{thread_id}/stream/events`)."""
+    return V1_STREAMING_GONE
 
 
 @router.post(

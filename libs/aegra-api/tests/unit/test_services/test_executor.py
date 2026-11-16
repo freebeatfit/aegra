@@ -145,7 +145,7 @@ class TestRunExecutorBoundaryConditions:
             patch("aegra_api.services.run_executor.start_run", new_callable=AsyncMock, return_value=True),
             patch("aegra_api.services.run_executor.finalize_run", new_callable=AsyncMock, return_value=True),
             patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
-            patch("aegra_api.services.run_executor.stream_graph_events", return_value=_empty_async_gen()),
+            patch("aegra_api.services.run_executor.stream_native_v3_events", return_value=_empty_async_gen()),
         ):
             mock_streaming.cleanup_run = AsyncMock()
             mock_streaming.signal_run_error = AsyncMock()

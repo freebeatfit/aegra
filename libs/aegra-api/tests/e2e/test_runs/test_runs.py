@@ -1,4 +1,5 @@
 import pytest
+from httpx import AsyncClient
 
 from aegra_api.settings import settings
 
@@ -10,7 +11,7 @@ from tests.e2e._utils import await_terminal_run, check_and_skip_if_geo_blocked, 
 @pytest.mark.asyncio
 async def test_runs_crud_and_join_e2e():
     """
-    Mirrors existing e2e style using the typed SDK client (see test_chat_streaming, test_background_run_join).
+    Mirrors existing e2e style using the typed SDK client (see test_background_run_join).
     Validates the non-streaming "background run" flow and CRUD around it:
       1) Ensure assistant exists (graph_id=agent)
       2) Create a thread
@@ -18,7 +19,7 @@ async def test_runs_crud_and_join_e2e():
       4) Join the run for final output
       5) Get the run by id
       6) List runs for the same thread and ensure presence
-      7) Stream endpoint for a terminal run should yield an end event quickly via SDK wrapper
+      7) The retired v1 join stream answers 410
     """
     client = get_e2e_client()
 
@@ -42,10 +43,6 @@ async def test_runs_crud_and_join_e2e():
         thread_id=thread_id,
         assistant_id=assistant_id,
         input={"messages": [{"role": "user", "content": "Say one short sentence."}]},
-        stream_mode=[
-            "messages",
-            "values",
-        ],  # ensure both modes are available for later stream
     )
     elog("Runs.create", run)
     assert "run_id" in run
@@ -81,21 +78,10 @@ async def test_runs_crud_and_join_e2e():
     assert isinstance(runs_list, list)
     assert any(r["run_id"] == run_id for r in runs_list)
 
-    # 7) Stream endpoint after completion: should yield an end event quickly.
-    # Reuse the SDK join_stream to align with current helper patterns.
-    # We accept that there may be zero deltas and just an "end".
-    if got["status"] == "success":
-        end_seen = False
-        async for chunk in client.runs.join_stream(
-            thread_id=thread_id,
-            run_id=run_id,
-            stream_mode=["messages", "values"],
-        ):
-            elog("Runs.stream(terminal) event", {"event": getattr(chunk, "event", None)})
-            if getattr(chunk, "event", None) == "end":
-                end_seen = True
-                break
-        assert end_seen, "Expected an 'end' event when streaming a terminal run"
+    # 7) The v1 join stream is retired: streaming is Agent Protocol v2 only.
+    async with AsyncClient(base_url=settings.app.SERVER_URL, timeout=10.0) as http_client:
+        gone = await http_client.get(f"/threads/{thread_id}/runs/{run_id}/stream")
+    assert gone.status_code == 410
 
 
 @pytest.mark.e2e
@@ -104,7 +90,7 @@ async def test_runs_cancel_e2e():
     """
     Cancellation flow aligned with e2e client helpers:
       1) Create assistant and thread
-      2) Start a streaming run via SDK client
+      2) Start a background run via SDK client
       3) Cancel the run via SDK
       4) Verify status is cancelled/interrupted/final afterward
     """
@@ -120,22 +106,11 @@ async def test_runs_cancel_e2e():
     thread_id = thread["thread_id"]
     assistant_id = assistant["assistant_id"]
 
-    # Start streaming run (returns an async iterator through the SDK)
-    stream = client.runs.stream(
+    await client.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id,
         input={"messages": [{"role": "user", "content": "Keep talking slowly."}]},
-        stream_mode=["messages"],
     )
-
-    # Consume a couple of events then cancel
-    events_seen = 0
-    async for chunk in stream:
-        events_seen += 1
-        elog("Runs.stream (pre-cancel)", {"event": getattr(chunk, "event", None)})
-        # Try to fetch a run id by listing runs; server persists runs metadata now
-        if events_seen >= 2:
-            break
 
     # Find the most recent run id
     runs_list = await client.runs.list(thread_id)
@@ -176,8 +151,6 @@ async def test_runs_wait_stateful_e2e():
       3) Verify output is returned directly (not a Run object)
       4) Verify run was created and completed
     """
-    from httpx import AsyncClient
-
     client = get_e2e_client()
 
     # 1) Setup: Create assistant and thread
@@ -248,8 +221,6 @@ async def test_runs_wait_with_interrupts_e2e():
 
     This test uses interrupt_before to force an interrupt.
     """
-    from httpx import AsyncClient
-
     client = get_e2e_client()
 
     # Setup

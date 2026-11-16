@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from aegra_api.services import run_waiters
 from aegra_api.services.run_waiters import run_result_body, thread_values_for
@@ -63,3 +65,14 @@ class TestThreadValuesFor:
     async def test_a_failed_read_falls_back_to_none(self) -> None:
         with patch.object(run_waiters, "_get_session_maker", side_effect=RuntimeError("db down")):
             assert await thread_values_for(_run(), MagicMock()) is None
+
+
+class TestEncodeOutput:
+    def test_thread_values_keep_message_structure(self) -> None:
+        """Thread values hold message objects; join/wait must send them as dicts, as /state does."""
+        body = json.loads(run_waiters.encode_output({"messages": [AIMessage(content="hi", id="m1")], "n": 1}))
+
+        assert body["n"] == 1
+        assert body["messages"][0]["type"] == "ai"
+        assert body["messages"][0]["content"] == "hi"
+        assert body["messages"][0]["id"] == "m1"

@@ -241,29 +241,34 @@ async def test_sse_stream_cross_instance() -> None:
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         thread_id = await create_thread(client)
-
-        # Create and stream via POST
-        async with client.stream(
-            "POST",
-            f"{BASE_URL}/threads/{thread_id}/runs/stream",
+        await client.post(
+            f"{BASE_URL}/threads/{thread_id}/runs",
             json={
                 "assistant_id": ASSISTANT_ID,
                 "input": {"messages": [{"role": "user", "content": "Say 'stream-cross-ok' and nothing else."}]},
             },
+        )
+
+        # The v2 thread stream; the run's root lifecycle closes it out.
+        async with client.stream(
+            "POST",
+            f"{BASE_URL}/threads/{thread_id}/stream/events",
+            json={"channels": ["values", "lifecycle"]},
             timeout=httpx.Timeout(60.0),
         ) as response:
             events = []
             async for line in response.aiter_lines():
-                line = line.strip()
-                if line.startswith("event:"):
-                    event_type = line[6:].strip()
-                    events.append(event_type)
-                    if event_type == "end":
-                        break
+                if not line.startswith("data: "):
+                    continue
+                event = json.loads(line.removeprefix("data: "))
+                events.append(event["method"])
+                root = event["method"] == "lifecycle" and not event["params"]["namespace"]
+                if root and event["params"]["data"]["event"] in ("completed", "failed", "interrupted"):
+                    break
 
             log("Stream events received", {"events": events, "count": len(events)})
-            assert len(events) > 0, "Expected at least one SSE event"
-            assert "metadata" in events, "Expected metadata event"
+            assert "values" in events, "Expected a values event"
+            assert "lifecycle" in events, "Expected a lifecycle event"
 
     log("PASSED")
 

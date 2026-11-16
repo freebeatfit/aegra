@@ -119,6 +119,18 @@ class TestStreamNativeV3Events:
         assert out
         assert "durability" not in graph.calls[0]
 
+    async def test_passes_breakpoints_as_arguments_not_config(self) -> None:
+        """LangGraph ignores interrupt_before/after in the config; they must be stream arguments."""
+        graph = _FakeGraph([_event("values", {"a": 1})])
+        config = {"configurable": {}, "interrupt_before": ["*"], "interrupt_after": ["review"]}
+
+        out = [pair async for pair in stream_native_v3_events(graph=graph, input_data={}, config=config)]
+
+        assert out
+        assert graph.calls[0]["interrupt_before"] == "*"
+        assert graph.calls[0]["interrupt_after"] == ["review"]
+        assert graph.calls[0]["config"] == {"configurable": {}}
+
 
 def _real_graph() -> Any:
     """A two-node graph with a checkpointer, so v3 emits values + checkpoints."""

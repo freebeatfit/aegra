@@ -547,27 +547,6 @@ class TestJoinRun:
         assert isinstance(resp.json(), (dict, list))
 
 
-class TestStreamRun:
-    """Test GET /threads/{thread_id}/runs/{run_id}/stream"""
-
-    def test_stream_run_not_found(self):
-        """Test streaming a non-existent run"""
-        app = create_test_app(include_runs=True, include_threads=False)
-
-        class Session(DummySessionBase):
-            async def scalar(self, _stmt):
-                return None
-
-        client = make_client(app)
-
-        # stream_run manages its session via _get_session_maker (not Depends),
-        # so the DI override doesn't apply — patch the maker instead.
-        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
-            resp = client.get("/threads/test-thread-123/runs/nonexistent/stream")
-
-        assert resp.status_code == 404
-
-
 class TestRunWithInput:
     """Test creating runs with input vs command"""
 

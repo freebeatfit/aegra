@@ -588,7 +588,7 @@ async def stream_llm_run(
     client: httpx.AsyncClient,
     prompt: str,
 ) -> tuple[str, int, float]:
-    """Stream an LLM run via SSE. Returns (status, event_count, elapsed)."""
+    """Stream an LLM run over the v2 thread stream. Returns (status, event_count, elapsed)."""
     thread_resp = await client.post(f"{BASE_URL}/threads", json={})
     thread_id = thread_resp.json()["thread_id"]
 
@@ -597,30 +597,29 @@ async def stream_llm_run(
     status = "unknown"
 
     try:
+        await client.post(
+            f"{BASE_URL}/threads/{thread_id}/runs",
+            json={"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": prompt}]}},
+        )
         async with client.stream(
             "POST",
-            f"{BASE_URL}/threads/{thread_id}/runs/stream",
-            json={
-                "assistant_id": "agent",
-                "input": {"messages": [{"role": "user", "content": prompt}]},
-            },
+            f"{BASE_URL}/threads/{thread_id}/stream/events",
+            json={"channels": ["messages", "lifecycle"]},
             timeout=httpx.Timeout(60.0),
         ) as response:
             async for line in response.aiter_lines():
-                line = line.strip()
-                if not line:
+                if not line.startswith("data: "):
                     continue
-                if line.startswith("event:"):
-                    event_count += 1
-                    event_type = line[6:].strip()
-                    if event_type == "end":
+                event_count += 1
+                event = json.loads(line.removeprefix("data: "))
+                if event["method"] == "lifecycle" and not event["params"]["namespace"]:
+                    terminal = event["params"]["data"]["event"]
+                    if terminal == "completed":
                         status = "success"
                         break
-
-        # If we exited without seeing "end", the stream closed cleanly
-        # which means the run completed (server closed the connection)
-        if status == "unknown" and event_count > 0:
-            status = "success"
+                    if terminal in ("failed", "interrupted"):
+                        status = terminal
+                        break
     except httpx.ReadTimeout:
         status = "timeout"
     except Exception as exc:
