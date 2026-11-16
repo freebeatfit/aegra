@@ -13,7 +13,9 @@ import asyncio
 import json
 import operator
 import os
+import socket
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -34,6 +36,7 @@ from sqlalchemy.pool import NullPool
 
 from aegra_api.api import event_streaming as es_module
 from aegra_api.core import orm
+from aegra_api.core import sse as sse_module
 from aegra_api.core.auth_deps import get_current_user, require_auth
 from aegra_api.core.redis_manager import STREAM_READ_CLIENT_NAME, RedisManager
 from aegra_api.models.auth import User
@@ -318,6 +321,70 @@ async def test_reader_resumes_after_client_kill_without_gap_or_duplicate(stream_
     event_ids = [event["event_id"] for event in killed.events]
     assert len(event_ids) == len(set(event_ids))
     assert [(e["event_id"], e["seq"]) for e in killed.events] == [(e["event_id"], e["seq"]) for e in fresh.events]
+
+
+def _read_to_eof(sock: socket.socket, timeout: float) -> bytes:
+    """Everything until the server closes; heartbeats would keep a per-recv timeout from firing."""
+    deadline = time.monotonic() + timeout
+    chunks: list[bytes] = []
+    while time.monotonic() < deadline:
+        sock.settimeout(max(deadline - time.monotonic(), 0.01))
+        chunk = sock.recv(65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+    raise TimeoutError("the server kept the stalled connection open")
+
+
+@pytest.mark.asyncio
+async def test_stalled_client_is_closed_after_the_send_timeout(
+    stream_server: _Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sse_module, "SEND_TIMEOUT_SECS", 1.0)
+    thread_id = str(uuid4())
+    async with (
+        httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http,
+        _open(http, thread_id, ["lifecycle"]) as stream,
+    ):
+        await stream_server.start_run(http, thread_id, "big:4000000")  # a 4 MB values event
+        await stream.read_until(_runs_ended(1))
+
+    body = json.dumps({"channels": ["values", "lifecycle"]}).encode()
+    request = (
+        f"POST /threads/{thread_id}/stream/events HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.connect(("127.0.0.1", stream_server.port))
+    try:
+        sock.sendall(request)
+        await asyncio.sleep(3)  # not reading: the server's send blocks, then times out
+        received = await asyncio.to_thread(_read_to_eof, sock, 15)
+    finally:
+        sock.close()
+
+    # The server closed the connection (EOF) without sending the frames after the stalled one.
+    assert received.startswith(b"HTTP/1.1 200")
+    assert b"event: values" in received
+    assert b'"event":"completed"' not in received
+
+
+@pytest.mark.asyncio
+async def test_read_failure_sends_the_error_event_and_closes(stream_server: _Server) -> None:
+    thread_id = str(uuid4())
+    async with (
+        httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http,
+        _open(http, thread_id, ["lifecycle"]) as stream,
+    ):
+        await asyncio.sleep(0.5)
+        stream_server.redis.set(stream_server.broker.stream_key(thread_id), "not a stream")
+        await stream.read_until(lambda _stream: False)
+
+    assert stream.ended
+    assert stream.errors == [
+        {"type": "error", "id": None, "error": "unknown_error", "message": "Thread event stream failed."}
+    ]
 
 
 @pytest.mark.asyncio

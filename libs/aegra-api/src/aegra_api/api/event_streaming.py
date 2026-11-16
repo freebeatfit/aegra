@@ -108,7 +108,7 @@ async def stream_thread_events(
     client can open the stream then issue ``run.start``. Each SSE frame's
     ``data:`` is a protocol event envelope; ``id:`` is the ``seq`` a client
     echoes back as ``since`` on resume. The stream stays open until the client
-    leaves.
+    leaves; a failed read ends it with an ``error`` event.
 
     DB work runs in short-lived sessions (the upfront ownership check here, and
     one lookup per run the stream sees) so no connection is held for the SSE lifetime (#423).
@@ -170,6 +170,23 @@ async def post_thread_command(
 
 
 async def _frame_events(session_stream: ThreadEventSession) -> AsyncGenerator[str, None]:
-    """Frame v2 event envelopes as SSE messages (event=method, data=envelope, id=seq)."""
-    async for envelope in session_stream.stream():
-        yield format_sse_message(envelope["method"], envelope, str(envelope["seq"]))
+    """Frame v2 event envelopes as SSE messages (event=method, data=envelope, id=seq).
+
+    A thread stream has no natural end, so one that stops failed: send the
+    LangGraph Agent Server's ``error`` event and close, so the client reconnects.
+    """
+    try:
+        async for envelope in session_stream.stream():
+            yield format_sse_message(envelope["method"], envelope, str(envelope["seq"]))
+    except Exception:
+        logger.exception("Thread event stream failed")
+        yield format_sse_message("error", _THREAD_STREAM_FAILED)
+
+
+# Fixed text: the exception can carry raw backend errors (official api/event_streaming.py).
+_THREAD_STREAM_FAILED = {
+    "type": "error",
+    "id": None,
+    "error": "unknown_error",
+    "message": "Thread event stream failed.",
+}

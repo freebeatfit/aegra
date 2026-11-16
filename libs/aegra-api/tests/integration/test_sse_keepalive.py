@@ -1,4 +1,4 @@
-"""SSE keepalive on the thread event stream.
+"""SSE lifetime of the thread event stream: heartbeats, the send timeout, the error event.
 
 Regression cover for a production bug where agents that opened upstream
 WebSockets (e.g. Sberdevices voice gateway) and held them silently for
@@ -11,14 +11,18 @@ This exercises the wiring the v2 route uses: ``ThreadEventSession`` →
 """
 
 import asyncio
+import json
 from collections.abc import Iterator
 from uuid import uuid4
 
 import pytest
 from sse_starlette import EventSourceResponse
+from starlette.types import Message
 
 from aegra_api.api.event_streaming import _frame_events
+from aegra_api.core import sse as sse_module
 from aegra_api.core.sse import get_sse_headers, make_sse_response, sse_to_bytes
+from aegra_api.services.base_broker import ThreadEntry
 from aegra_api.services.broker import BrokerManager
 from aegra_api.services.event_streaming import session as session_module
 from aegra_api.services.event_streaming.session import ThreadEventSession
@@ -60,3 +64,37 @@ async def test_keepalive_pings_during_silent_run(local_broker_manager: BrokerMan
 
     heartbeat_hits = body.count(b": heartbeat")
     assert heartbeat_hits >= 2, f"Expected >= 2 heartbeat comments during silence, got {heartbeat_hits}. Body={body!r}"
+
+
+@pytest.mark.asyncio
+async def test_idle_stream_whose_client_stopped_reading_ends_at_the_send_timeout(
+    local_broker_manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On an idle stream the heartbeat is the only send, so it must time out too."""
+    monkeypatch.setattr(sse_module, "SEND_TIMEOUT_SECS", 0.5)
+
+    def stalled(message: Message) -> float:
+        return 3600 if message["type"] == "http.response.body" else 0
+
+    body = await drive_sse(_response(str(uuid4())), stop=lambda _b: False, timeout=5, send_delay=stalled)
+
+    assert body == b""
+
+
+@pytest.mark.asyncio
+async def test_failed_read_sends_the_error_event_and_ends(
+    local_broker_manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failing_read(_thread_id: str, _after: str) -> list[ThreadEntry]:
+        raise ConnectionError("Redis went away")
+
+    monkeypatch.setattr(local_broker_manager, "read_thread", failing_read)
+
+    body = await drive_sse(_response(str(uuid4())), stop=lambda _b: False, timeout=5)
+
+    frames = [frame for frame in body.decode().split("\n\n") if frame.startswith("event: ")]
+    assert len(frames) == 1
+    assert frames[0].startswith("event: error\n")
+    data = json.loads(frames[0].split("data: ", 1)[1])
+    # Fixed text: backend errors never reach the client.
+    assert data == {"type": "error", "id": None, "error": "unknown_error", "message": "Thread event stream failed."}

@@ -349,6 +349,8 @@ Params outside the documented set are logged at warning level with their key nam
 
 The SSE filter is a POST body listing the channels you want — no run id. Pass `since` (the last `seq` you saw) to resume after a dropped connection.
 
+The stream stays open until the client disconnects: while idle it sends a `: heartbeat` comment every 5 seconds and never closes on its own. A client that stops reading is disconnected once a send has waited 120 seconds. If the server can't read the thread's events, it sends an `error` event (`{"type":"error","error":"unknown_error",...}`) and closes the stream, so the client reconnects.
+
 ```bash
 curl -N -X POST http://localhost:8000/threads/$THREAD/stream/events \
   -H "Content-Type: application/json" \

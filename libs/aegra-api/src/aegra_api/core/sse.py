@@ -6,13 +6,23 @@ import re
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
 from typing import Any
 
+import anyio
+import structlog
 from sse_starlette import EventSourceResponse, ServerSentEvent
+from sse_starlette.sse import SendTimeoutError
+from starlette.types import Message, Receive, Scope, Send
 
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.settings import settings
 
+logger = structlog.getLogger(__name__)
+
 # Global serializer instance
 _serializer = GeneralSerializer()
+
+# A client that stops reading would block a send forever, holding the stream and
+# its Redis read. The LangGraph Agent Server's value (sse.py SEND_TIMEOUT_SECS).
+SEND_TIMEOUT_SECS: float = 120
 
 # Cached SSE keepalive payload: ``: heartbeat\r\n\r\n`` (15 bytes).
 # Matches langgraph-api's wire-format so tcpdump/logs line up with LangGraph
@@ -86,6 +96,26 @@ async def sse_to_bytes(inner: AsyncGenerator[str, None]) -> AsyncGenerator[bytes
             yield chunk.encode("utf-8")
 
 
+class _SendTimeoutEventSourceResponse(EventSourceResponse):
+    """Ends the response when a send, heartbeats included, waits longer than ``send_timeout``.
+
+    sse-starlette times out data sends only; on an idle thread stream the
+    heartbeat is the only send, so it must time out too.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_or_time_out(message: Message) -> None:
+            with anyio.move_on_after(self.send_timeout) as timeout:
+                await send(message)
+            if timeout.cancelled_caught:
+                raise SendTimeoutError()
+
+        try:
+            await super().__call__(scope, receive, send_or_time_out)
+        except* SendTimeoutError:
+            logger.warning("Closing a stream whose client stopped reading")
+
+
 def make_sse_response(
     body: AsyncIterator[bytes],
     *,
@@ -96,14 +126,15 @@ def make_sse_response(
     """Construct an ``EventSourceResponse`` with our shared SSE defaults.
 
     Centralizes ping interval + heartbeat factory so every SSE endpoint
-    emits identical wire-format keepalives. ``settings`` is read at call
-    time so live overrides (e.g. tests, env reloads) take effect.
+    emits identical wire-format keepalives, and the send timeout. ``settings``
+    and ``SEND_TIMEOUT_SECS`` are read at call time so overrides take effect.
     """
-    return EventSourceResponse(
+    return _SendTimeoutEventSourceResponse(
         body,
         status_code=status_code,
         ping=settings.app.sse_ping_interval_secs,
         ping_message_factory=heartbeat_factory,
+        send_timeout=SEND_TIMEOUT_SECS,
         client_close_handler_callable=close_handler,
         headers=dict(headers),
     )
