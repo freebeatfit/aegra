@@ -284,7 +284,7 @@ class TestStreamRoute:
         monkeypatch.setattr(
             es_module,
             "ThreadEventSession",
-            partial(ThreadEventSession, idle_grace_seconds=0.01),
+            partial(ThreadEventSession, discovery_fallback_seconds=0.01, max_idle_seconds=0.01),
         )
         client = TestClient(_make_app(monkeypatch, run_ids=[run_id]))
 
@@ -319,7 +319,7 @@ class TestStreamRoute:
         monkeypatch.setattr(
             es_module,
             "ThreadEventSession",
-            partial(ThreadEventSession, idle_grace_seconds=0.01),
+            partial(ThreadEventSession, discovery_fallback_seconds=0.01, max_idle_seconds=0.01),
         )
         monkeypatch.setattr(
             es_module,
@@ -374,7 +374,7 @@ class TestStreamRoute:
         monkeypatch.setattr(
             es_module,
             "ThreadEventSession",
-            partial(ThreadEventSession, idle_grace_seconds=5),
+            partial(ThreadEventSession, max_idle_seconds=5),
         )
         make_sse_response = es_module.make_sse_response
 

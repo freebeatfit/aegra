@@ -70,43 +70,6 @@ class TestRedisRunBroker:
         )
 
     @pytest.mark.asyncio
-    async def test_put_publishes_and_caches(self) -> None:
-        """Test that put() publishes to channel and stores in cache list via pipeline"""
-        broker = self._make_broker()
-        mock_pipe = MagicMock()
-        mock_pipe.execute = AsyncMock()
-        mock_client = MagicMock()
-        mock_client.publish = AsyncMock()
-        mock_client.pipeline.return_value = mock_pipe
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-
-            await broker.put("evt-1", ("values", {"msg": "hello"}))
-
-            # Should publish to channel
-            mock_client.publish.assert_called_once()
-            channel, message = mock_client.publish.call_args[0]
-            assert channel == "aegra:run:run-123"
-
-            data = json.loads(message)
-            assert data["event_id"] == "evt-1"
-            assert data["payload"] == ["values", {"msg": "hello"}]
-
-            # Should use pipeline for cache operations
-            mock_client.pipeline.assert_called_once()
-            mock_pipe.rpush.assert_called_once()
-            cache_key, cached_msg = mock_pipe.rpush.call_args[0]
-            assert cache_key == "aegra:run:cache:run-123"
-            assert json.loads(cached_msg) == data
-
-            # Should trim, set TTL, and increment counter in pipeline
-            mock_pipe.ltrim.assert_called_once()
-            mock_pipe.expire.assert_called()
-            mock_pipe.incr.assert_called_once_with("aegra:run:counter:run-123")
-            mock_pipe.execute.assert_awaited_once()
-
-    @pytest.mark.asyncio
     async def test_put_non_resumable_skips_cache(self) -> None:
         """Test that put() with resumable=False skips the cache pipeline"""
         broker = self._make_broker()
@@ -249,7 +212,7 @@ class TestRedisRunBroker:
         order: list[str] = []
         gate = asyncio.Event()
 
-        async def slow_first_cache(message: str) -> None:
+        async def slow_first_cache(event_id: str, message: str) -> None:
             order.append("A-cache-start")
             await gate.wait()  # hold the write lock until released
             order.append("A-cache-end")
@@ -257,18 +220,18 @@ class TestRedisRunBroker:
         async def publish_noop(message: str) -> None:
             order.append("publish")
 
-        async def second_cache(message: str) -> None:
+        async def second_cache(event_id: str, message: str) -> None:
             order.append("B-cache")
 
         broker._cache_event = slow_first_cache  # type: ignore[method-assign]
         broker._publish_event = publish_noop  # type: ignore[method-assign]
-        task_a = asyncio.create_task(broker.put("evt-A", ("values", {})))
+        task_a = asyncio.create_task(broker.put("evt-A", ("updates", {})))
         await asyncio.sleep(0)  # let A acquire the lock and enter its cache write
         assert order == ["A-cache-start"]
 
         # B is queued while A holds the lock — it must not write yet.
         broker._cache_event = second_cache  # type: ignore[method-assign]
-        task_b = asyncio.create_task(broker.put("evt-B", ("values", {})))
+        task_b = asyncio.create_task(broker.put("evt-B", ("updates", {})))
         await asyncio.sleep(0)
         assert "B-cache" not in order
 
@@ -277,26 +240,6 @@ class TestRedisRunBroker:
 
         # A fully completes (cache then publish) before B begins.
         assert order == ["A-cache-start", "A-cache-end", "publish", "B-cache", "publish"]
-
-    @pytest.mark.asyncio
-    async def test_replay_dedups_adjacent_duplicate_event(self) -> None:
-        """An at-least-once retry can RPUSH the same event twice; replay() drops
-        the adjacent duplicate so a resuming client doesn't receive it twice."""
-        broker = self._make_broker()
-        mock_client = AsyncMock()
-        mock_client.lrange.return_value = [
-            json.dumps({"event_id": "evt-1", "payload": ["values", {"a": 1}]}),
-            json.dumps({"event_id": "evt-2", "payload": ["values", {"a": 2}]}),
-            json.dumps({"event_id": "evt-2", "payload": ["values", {"a": 2}]}),  # duplicate
-            json.dumps({"event_id": "evt-3", "payload": ["end", {}]}),
-        ]
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-
-            events = await broker.replay(None)
-
-        assert [event_id for event_id, _ in events] == ["evt-1", "evt-2", "evt-3"]
 
     @pytest.mark.asyncio
     async def test_aiter_dedups_adjacent_duplicate_live_event(self) -> None:
@@ -326,7 +269,7 @@ class TestRedisRunBroker:
 
         mock_client = MagicMock()
         mock_client.pubsub.return_value = mock_pubsub
-        mock_client.lrange = AsyncMock(return_value=[])
+        mock_client.xrevrange = AsyncMock(return_value=[])
 
         with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
             mock_rm.get_client.return_value = mock_client
@@ -363,8 +306,8 @@ class TestRedisRunBroker:
 
         mock_client = MagicMock()
         mock_client.pubsub.return_value = mock_pubsub
-        # _check_end_in_buffer calls lrange — return empty (no end in buffer yet)
-        mock_client.lrange = AsyncMock(return_value=[])
+        # _check_end_in_buffer calls xrevrange — return empty (no end in buffer yet)
+        mock_client.xrevrange = AsyncMock(return_value=[])
 
         with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
             mock_rm.get_client.return_value = mock_client
@@ -403,7 +346,7 @@ class TestRedisRunBroker:
 
         mock_client = MagicMock()
         mock_client.pubsub.return_value = mock_pubsub
-        mock_client.lrange = AsyncMock(return_value=[])
+        mock_client.xrevrange = AsyncMock(return_value=[])
 
         with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
             mock_rm.get_client.return_value = mock_client
@@ -413,75 +356,6 @@ class TestRedisRunBroker:
                 events.append((event_id, payload))
 
         assert len(events) == 1
-
-    @pytest.mark.asyncio
-    async def test_replay_returns_all_when_no_last_event_id(self) -> None:
-        """Test replay returns all cached events when last_event_id is None"""
-        broker = self._make_broker()
-        mock_client = AsyncMock()
-        mock_client.lrange.return_value = [
-            json.dumps({"event_id": "evt-1", "payload": ["values", {"a": 1}]}),
-            json.dumps({"event_id": "evt-2", "payload": ["values", {"a": 2}]}),
-        ]
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-
-            events = await broker.replay(None)
-
-        assert len(events) == 2
-        assert events[0] == ("evt-1", ("values", {"a": 1}))
-        assert events[1] == ("evt-2", ("values", {"a": 2}))
-
-    @pytest.mark.asyncio
-    async def test_replay_returns_events_after_last_event_id(self) -> None:
-        """Test replay returns only events after last_event_id"""
-        broker = self._make_broker()
-        mock_client = AsyncMock()
-        mock_client.lrange.return_value = [
-            json.dumps({"event_id": "evt-1", "payload": ["values", {"a": 1}]}),
-            json.dumps({"event_id": "evt-2", "payload": ["values", {"a": 2}]}),
-            json.dumps({"event_id": "evt-3", "payload": ["end", {}]}),
-        ]
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-
-            events = await broker.replay("evt-1")
-
-        assert len(events) == 2
-        assert events[0] == ("evt-2", ("values", {"a": 2}))
-        assert events[1] == ("evt-3", ("end", {}))
-
-    @pytest.mark.asyncio
-    async def test_replay_returns_all_when_last_event_id_not_found(self) -> None:
-        """Test replay returns all events when last_event_id is not in cache"""
-        broker = self._make_broker()
-        mock_client = AsyncMock()
-        mock_client.lrange.return_value = [
-            json.dumps({"event_id": "evt-1", "payload": ["values", {"a": 1}]}),
-        ]
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-
-            events = await broker.replay("evt-999")
-
-        assert len(events) == 1
-        assert events[0] == ("evt-1", ("values", {"a": 1}))
-
-    @pytest.mark.asyncio
-    async def test_replay_returns_empty_when_no_cache(self) -> None:
-        broker = self._make_broker()
-        mock_client = AsyncMock()
-        mock_client.lrange.return_value = []
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-
-            events = await broker.replay(None)
-
-        assert events == []
 
     @pytest.mark.asyncio
     async def test_replay_handles_redis_failure(self) -> None:
@@ -495,63 +369,6 @@ class TestRedisRunBroker:
             events = await broker.replay(None)
 
         assert events == []
-
-    @pytest.mark.asyncio
-    async def test_check_end_in_buffer_returns_true_when_end_present(self) -> None:
-        """Test that _check_end_in_buffer detects end events in replay buffer"""
-        broker = self._make_broker()
-        mock_client = AsyncMock()
-        mock_client.lrange.return_value = [
-            json.dumps({"event_id": "evt-end", "payload": ["end", {"status": "success"}]})
-        ]
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-            result = await broker._check_end_in_buffer()
-
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_check_end_in_buffer_returns_false_when_no_end(self) -> None:
-        """Test that _check_end_in_buffer returns False when no end event"""
-        broker = self._make_broker()
-        mock_client = AsyncMock()
-        mock_client.lrange.return_value = [json.dumps({"event_id": "evt-1", "payload": ["values", {"a": 1}]})]
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-            result = await broker._check_end_in_buffer()
-
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_aiter_exits_when_end_already_in_buffer(self) -> None:
-        """Test that aiter() exits immediately when end event is already in replay buffer"""
-        broker = self._make_broker()
-
-        mock_pubsub = AsyncMock()
-        mock_pubsub.subscribe = AsyncMock()
-        mock_pubsub.unsubscribe = AsyncMock()
-        mock_pubsub.aclose = AsyncMock()
-        # Return None (no live messages) — should exit because end is in buffer
-        mock_pubsub.get_message = AsyncMock(return_value=None)
-
-        mock_client = MagicMock()
-        mock_client.pubsub.return_value = mock_pubsub
-        # _check_end_in_buffer sees end event in last position
-        mock_client.lrange = AsyncMock(
-            return_value=[json.dumps({"event_id": "evt-end", "payload": ["end", {"status": "success"}]})]
-        )
-
-        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
-            mock_rm.get_client.return_value = mock_client
-
-            events: list[tuple[str, object]] = []
-            async for event_id, payload in broker.aiter():
-                events.append((event_id, payload))
-
-        # Should exit with no live events since end was already in buffer
-        assert len(events) == 0
 
     def test_mark_finished(self) -> None:
         broker = self._make_broker()

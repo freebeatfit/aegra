@@ -12,6 +12,20 @@ message payloads, and derives the terminal lifecycle event.
 ``seq`` is the reconnect cursor: a client resends the last ``seq`` it saw as
 ``since`` and the session skips anything at or below it. ``event_id`` is a
 distinct unique-per-event string used by the client for dedup.
+
+What a connection replays (aligned with the LangGraph Agent Server, which
+replays the run in flight and leaves settled history to ``getState()``):
+
+* an active run (``pending``/``running``): its latest values snapshot and
+  every delta after it, then live events;
+* settled runs: only the newest one, compactly (its last state and how it
+  ended), so a client that subscribed late still sees the terminal and the
+  state it closed on; older settled runs are not read at all;
+* a ``since`` cursor at or past a run's last event skips that run's broker.
+
+The connection stays open with heartbeats until the client leaves. New runs
+are found from a thread notice (``broker_manager.notify_thread``) with a slow
+fallback read, not by polling the database.
 """
 
 from __future__ import annotations
@@ -31,13 +45,18 @@ from aegra_api.services.event_streaming.normalizers import (
     strip_interrupts,
 )
 from aegra_api.services.event_streaming.protocol import build_event
+from aegra_api.services.replay_policy import is_after
 from aegra_api.utils import extract_event_sequence
 
 __all__ = ["RunLister", "ThreadEventSession", "validate_channels"]
 
-# Grace window covering the SDK gap between stream open and run.start landing.
-_IDLE_GRACE_SECONDS = 30.0
-_POLL_INTERVAL_SECONDS = 0.25
+# Fallback re-read of the thread's runs when no notice arrives (a lost publish,
+# a run created by an older instance). Notices make new runs visible at once.
+_RUN_DISCOVERY_FALLBACK_SECONDS = 5.0
+# Settled runs that still have buffered events, newest first, that a
+# connection replays compactly. One: the run the client may have just missed.
+_SETTLED_RUNS_REPLAYED = 1
+_ACTIVE_RUN_STATUSES = frozenset({"pending", "running"})
 
 # Async callable returning the thread's (run_id, status, graph_name, created_at) rows, oldest
 # first. Status backstops expired runs (see _drain_run); created_at anchors the run's seq.
@@ -67,7 +86,8 @@ class ThreadEventSession:
         since: int | None = None,
         namespaces: list[list[str]] | None = None,
         depth: int | None = None,
-        idle_grace_seconds: float = _IDLE_GRACE_SECONDS,
+        discovery_fallback_seconds: float = _RUN_DISCOVERY_FALLBACK_SECONDS,
+        max_idle_seconds: float | None = None,
     ) -> None:
         self._thread_id = thread_id
         self._channels = channels
@@ -75,7 +95,9 @@ class ThreadEventSession:
         self._since = since
         self._namespaces = [tuple(prefix) for prefix in namespaces] if namespaces else None
         self._depth = depth
-        self._idle_grace = idle_grace_seconds
+        self._discovery_fallback = discovery_fallback_seconds
+        # None: stay open until the client disconnects (the server default).
+        self._max_idle = max_idle_seconds
         self._seq = 0
         self._drained: set[str] = set()
         # One input.requested per interrupt per session — the same interrupt can
@@ -95,41 +117,85 @@ class ThreadEventSession:
         return self._seq
 
     async def stream(self) -> AsyncIterator[dict[str, Any]]:
-        """Yield v2 envelopes for the thread's runs until they finish + idle.
+        """Yield v2 envelopes for the thread's runs until the client disconnects.
 
         The stream stays open across the gap between runs so a HITL resume
         (``input.respond`` starts a fresh run on the same thread) is delivered
-        on the same SSE connection the SDK holds open. An interrupted run keeps
-        the full grace window; a terminal run still waits one grace window so a
-        same-thread follow-up run is not dropped, but never blocks forever.
+        on the same SSE connection the SDK holds open; the SSE layer sends
+        heartbeats meanwhile. A new run is picked up when its creation notice
+        arrives, or at the latest after the fallback interval.
         """
-        idle_deadline: float | None = None
         loop = asyncio.get_running_loop()
+        idle_since = loop.time()
+        first = True
+        async with broker_manager.thread_waiter(self._thread_id) as waiter:
+            while True:
+                waiter.clear()
+                rows = await self._list_run_ids()
+                plan = self._plan(rows, first=first)
+                first = False
+                progressed = False
+                for run_id, run_status, graph_name, created_at, settled in plan:
+                    async for envelope in self._drain_run(run_id, run_status, graph_name, created_at, settled=settled):
+                        progressed = True
+                        yield envelope
+                    self._drained.add(run_id)
+                for row in rows:
+                    if row[1] not in _ACTIVE_RUN_STATUSES:
+                        self._drained.add(row[0])
 
-        while True:
-            progressed = False
-            for run_id, run_status, graph_name, created_at in await self._fresh_runs():
-                async for envelope in self._drain_run(run_id, run_status, graph_name, created_at):
-                    progressed = True
-                    yield envelope
-                self._drained.add(run_id)
+                if progressed:
+                    idle_since = loop.time()
+                    continue
+                if self._max_idle is not None and loop.time() - idle_since >= self._max_idle:
+                    return
+                await waiter.wait(self._discovery_fallback)
 
-            if progressed:
-                idle_deadline = None
-                continue
+    def _plan(
+        self, rows: list[tuple[str, str | None, str | None, datetime | None]], *, first: bool
+    ) -> list[tuple[str, str | None, str | None, datetime | None, bool]]:
+        """Which runs to drain now, oldest first, and whether each is settled.
 
-            now = loop.time()
-            if idle_deadline is None:
-                idle_deadline = now + self._idle_grace
-            elif now >= idle_deadline:
-                return
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+        Active runs are always drained in full. On the connection's first read,
+        the newest settled runs are replayed compactly; settled runs that show
+        up later (a run that finished between two reads) are drained in full,
+        since this connection never saw them start.
+        """
+        fresh = [row for row in rows if row[0] not in self._drained]
+        settled = [row for row in fresh if row[1] not in _ACTIVE_RUN_STATUSES]
+        keep_settled = {row[0] for row in settled[-_SETTLED_RUNS_REPLAYED:]} if first else {row[0] for row in settled}
+        plan: list[tuple[str, str | None, str | None, datetime | None, bool]] = []
+        for run_id, status, graph_name, created_at in fresh:
+            if status in _ACTIVE_RUN_STATUSES:
+                plan.append((run_id, status, graph_name, created_at, False))
+            elif run_id in keep_settled:
+                plan.append((run_id, status, graph_name, created_at, first))
+        return plan
 
-    async def _fresh_runs(self) -> list[tuple[str, str | None, str | None, datetime | None]]:
-        return [row for row in await self._list_run_ids() if row[0] not in self._drained]
+    def _cursor_for(self, created_at: datetime | None) -> str | None:
+        """The broker event id the client's ``since`` already covers in this run.
+
+        ``seq`` is ``run_base + ordinal * slots (+ index)``, so ``since`` maps
+        back to the last ordinal it saw. None replays the run from its start.
+        """
+        if self._since is None or created_at is None:
+            return None
+        base = _run_seq_base(created_at)
+        if self._since < base:
+            return None
+        ordinal = (self._since - base) // _SEQ_SLOTS_PER_EVENT
+        if ordinal <= 0:
+            return None
+        return f"{self._current_run}_event_{ordinal}"
 
     async def _drain_run(
-        self, run_id: str, run_status: str | None, graph_name: str | None, created_at: datetime | None
+        self,
+        run_id: str,
+        run_status: str | None,
+        graph_name: str | None,
+        created_at: datetime | None,
+        *,
+        settled: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """Replay then tail one run's broker, re-enveloping each native event.
 
@@ -137,6 +203,9 @@ class ThreadEventSession:
         ``running`` seed opens it, per-subgraph events flow through, and the
         terminal closes any still-open subgraph namespaces before the root
         status (a cancel mid-subgraph otherwise leaves them started forever).
+
+        Replay starts at the client's ``since`` cursor and reads the broker in
+        batches. A settled run replays compactly (``replay_settled``).
 
         The persisted run status backstops runs whose broker events expired
         (replay TTL / cleanup): without it, ``aiter`` on a recreated empty
@@ -154,15 +223,21 @@ class ThreadEventSession:
         if self._run_seq_base is not None:
             self._seq = max(self._seq, self._run_seq_base)
         self._open_namespaces = {}
+        cursor = self._cursor_for(created_at)
 
-        replayed = await broker.replay(None)
-        if run_status in _TERMINAL_RUN_STATUSES and not replayed:
-            return
+        if settled:
+            replay: AsyncIterator[tuple[str, Any]] = _aiter_list(await broker.replay_settled(cursor))
+        else:
+            replay = broker.replay_iter(cursor)
 
-        for envelope in self._emit([("lifecycle", self._root_lifecycle("running"), [])], f"synth:{run_id}:running"):
-            yield envelope
-
-        for event_id, raw_event in replayed:
+        started = False
+        async for event_id, raw_event in replay:
+            if not started:
+                started = True
+                for envelope in self._emit(
+                    [("lifecycle", self._root_lifecycle("running"), [])], f"synth:{run_id}:running"
+                ):
+                    yield envelope
             seen.add(event_id)
             for envelope in self._project(event_id, raw_event):
                 yield envelope
@@ -170,12 +245,20 @@ class ThreadEventSession:
                 return
 
         if run_status in _TERMINAL_RUN_STATUSES:
+            if not started:
+                return
             for envelope in self._project(f"{run_id}:status-end", ("end", {"status": run_status})):
                 yield envelope
             return
 
+        if not started:
+            for envelope in self._emit([("lifecycle", self._root_lifecycle("running"), [])], f"synth:{run_id}:running"):
+                yield envelope
+
         async for event_id, raw_event in broker.aiter():
             if event_id in seen:
+                continue
+            if cursor is not None and not is_after(event_id, cursor):
                 continue
             for envelope in self._project(event_id, raw_event):
                 yield envelope
@@ -390,6 +473,11 @@ class ThreadEventSession:
         if self._namespaces is None:
             return True
         return any(_prefix_matches(namespace, prefix) for prefix in self._namespaces)
+
+
+async def _aiter_list(items: list[tuple[str, Any]]) -> AsyncIterator[tuple[str, Any]]:
+    for item in items:
+        yield item
 
 
 def _run_seq_base(created_at: datetime) -> int:

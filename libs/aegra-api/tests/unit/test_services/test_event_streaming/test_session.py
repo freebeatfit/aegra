@@ -78,7 +78,7 @@ def _make_session(
         since=since,
         namespaces=namespaces,
         depth=depth,
-        idle_grace_seconds=0.0,
+        max_idle_seconds=0.0,
     )
 
 
@@ -230,7 +230,10 @@ class TestSeqAndFilter:
             ],
         )
         events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",), since=1))
-        assert [e["seq"] for e in events] == [2, 3, 4]
+        # The broker keeps only the newest values snapshot of a v2 run, so the
+        # superseded {"a": 1} is gone; seq stays absolute (running seed = 1).
+        assert [e["seq"] for e in events] == [2, 3]
+        assert [e["params"]["data"] for e in events if e["method"] == "values"] == [{"a": 2}]
 
     async def test_applied_through_seq_tracks_max(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
@@ -253,13 +256,13 @@ class TestSeqAndFilter:
 
     async def test_seq_survives_a_trimmed_replay_buffer(self, manager: BrokerManager) -> None:
         """Redis keeps only the newest events per run; a retained event keeps the seq it had before the trim."""
-        events = [("values", _protocol_event("values", {"i": i})) for i in range(1, 6)] + [
+        events = [("updates", _protocol_event("updates", {"node": {"i": i}})) for i in range(1, 6)] + [
             ("end", {"status": "success"})
         ]
         await _seed(manager, "run-1", events)
         created = {"run-1": datetime(2026, 1, 1, tzinfo=UTC)}
         full = await _collect(
-            _make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",), created=created)
+            _make_session("t1", channels={"updates", "lifecycle"}, run_ids=("run-1",), created=created)
         )
         manager.remove_broker("run-1")
         broker = manager.get_or_create_broker("run-1")
@@ -268,11 +271,11 @@ class TestSeqAndFilter:
                 await broker.put(f"run-1_event_{i}", raw)
 
         trimmed = await _collect(
-            _make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",), created=created)
+            _make_session("t1", channels={"updates", "lifecycle"}, run_ids=("run-1",), created=created)
         )
         resumed = await _collect(
             _make_session(
-                "t1", channels={"values", "lifecycle"}, run_ids=("run-1",), created=created, since=full[3]["seq"]
+                "t1", channels={"updates", "lifecycle"}, run_ids=("run-1",), created=created, since=full[3]["seq"]
             )
         )
 
@@ -283,13 +286,13 @@ class TestSeqAndFilter:
     async def test_fallback_event_id_does_not_jump_seq(self, manager: BrokerManager) -> None:
         """An epoch-ms id from the allocator's Redis fallback is not an event count."""
         broker = manager.get_or_create_broker("run-1")
-        await broker.put("run-1_event_1", ("values", _protocol_event("values", {"a": 1})))
-        await broker.put("run-1_event_1794574673377", ("values", _protocol_event("values", {"a": 2})))
+        await broker.put("run-1_event_1", ("updates", _protocol_event("updates", {"n": {"a": 1}})))
+        await broker.put("run-1_event_1794574673377", ("updates", _protocol_event("updates", {"n": {"a": 2}})))
         await broker.put("run-1_event_3", ("end", {"status": "success"}))
         created = {"run-1": datetime(2026, 1, 1, tzinfo=UTC)}
 
         events = await _collect(
-            _make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",), created=created)
+            _make_session("t1", channels={"updates", "lifecycle"}, run_ids=("run-1",), created=created)
         )
 
         base = events[0]["seq"] - 1
@@ -471,7 +474,11 @@ class TestResumeAcrossRuns:
     async def test_repeated_interrupt_id_is_emitted_for_each_run(
         self: "TestResumeAcrossRuns", manager: BrokerManager
     ) -> None:
-        """A resumed run may reuse its predecessor's interrupt ID."""
+        """A resumed run may reuse its predecessor's interrupt ID.
+
+        run-a is the newest settled run (replayed compactly on connect) and
+        run-b the run in flight; each emits its own input.requested.
+        """
         for run_id, question in (("run-a", "First question?"), ("run-b", "Second question?")):
             await _seed(
                 manager,
@@ -494,7 +501,7 @@ class TestResumeAcrossRuns:
                 "t1",
                 channels={"input", "values", "lifecycle"},
                 run_ids=("run-a", "run-b"),
-                statuses={"run-a": "interrupted", "run-b": "interrupted"},
+                statuses={"run-a": "interrupted", "run-b": "running"},
             )
         )
 
@@ -540,7 +547,8 @@ class TestResumeAcrossRuns:
             "t1",
             channels={"input", "values", "lifecycle"},
             list_run_ids=lister,
-            idle_grace_seconds=5.0,
+            discovery_fallback_seconds=0.05,
+            max_idle_seconds=0.5,
         )
         seeder = asyncio.create_task(reveal_run_b())
         events = [e async for e in session.stream()]
@@ -880,3 +888,139 @@ class TestValidateChannels:
     def test_non_list_is_error(self) -> None:
         valid, invalid = validate_channels("messages")
         assert invalid
+
+
+class TestReplayScope:
+    """FB patch P3: a connection replays the run in flight, not the thread's history."""
+
+    async def test_old_settled_runs_are_not_read(self, manager: BrokerManager) -> None:
+        for run_id in ("run-1", "run-2", "run-3"):
+            await _seed(
+                manager, run_id, [("values", _protocol_event("values", {"r": run_id})), ("end", {"status": "success"})]
+            )
+        read: list[str] = []
+        original = manager.get_or_create_broker
+
+        def tracking(run_id: str) -> Any:
+            read.append(run_id)
+            return original(run_id)
+
+        manager.get_or_create_broker = tracking  # type: ignore[method-assign]
+        events = await _collect(
+            _make_session(
+                "t1",
+                channels={"values", "lifecycle"},
+                run_ids=("run-1", "run-2", "run-3"),
+                statuses={"run-1": "success", "run-2": "success", "run-3": "success"},
+            )
+        )
+        # Only the newest settled run is replayed (compactly); older ones are never touched.
+        assert read == ["run-3"]
+        assert [e["params"]["data"] for e in events if e["method"] == "values"] == [{"r": "run-3"}]
+
+    async def test_active_run_is_replayed_in_full_after_a_settled_one(self, manager: BrokerManager) -> None:
+        await _seed(manager, "run-1", [("values", _protocol_event("values", {"r": 1})), ("end", {"status": "success"})])
+        await _seed(
+            manager,
+            "run-2",
+            [
+                _msg_event("message-start", role="ai", id="m1"),
+                _msg_event("content-block-delta", index=0, delta={"type": "text-delta", "text": "hi"}),
+                ("end", {"status": "success"}),
+            ],
+        )
+        events = await _collect(
+            _make_session(
+                "t1",
+                channels={"messages", "values", "lifecycle"},
+                run_ids=("run-1", "run-2"),
+                statuses={"run-1": "success", "run-2": "running"},
+            )
+        )
+        kinds = [(e["method"], e["params"]["data"].get("event")) for e in events]
+        assert ("messages", "message-start") in kinds
+        assert ("messages", "content-block-delta") in kinds
+
+    async def test_settled_replay_drops_message_deltas(self, manager: BrokerManager) -> None:
+        await _seed(
+            manager,
+            "run-1",
+            [
+                _msg_event("message-start", role="ai", id="m1"),
+                ("values", _protocol_event("values", {"messages": ["done"]})),
+                ("end", {"status": "success"}),
+            ],
+        )
+        events = await _collect(
+            _make_session(
+                "t1", channels={"messages", "values", "lifecycle"}, run_ids=("run-1",), statuses={"run-1": "success"}
+            )
+        )
+        assert [e["method"] for e in events] == ["lifecycle", "values", "lifecycle"]
+
+    async def test_since_past_a_run_skips_its_replay(self, manager: BrokerManager) -> None:
+        created = {"run-1": datetime(2026, 1, 1, tzinfo=UTC)}
+        await _seed(
+            manager,
+            "run-1",
+            [
+                _msg_event("message-start", role="ai", id="m1"),
+                _msg_event("message-finish"),
+                ("end", {"status": "success"}),
+            ],
+        )
+        full = await _collect(
+            _make_session("t1", channels={"messages", "lifecycle"}, run_ids=("run-1",), created=created)
+        )
+        resumed = await _collect(
+            _make_session(
+                "t1", channels={"messages", "lifecycle"}, run_ids=("run-1",), created=created, since=full[1]["seq"]
+            )
+        )
+        assert [e["event_id"] for e in resumed] == [e["event_id"] for e in full[2:]]
+
+
+class TestStaysOpen:
+    """FB patch P3: the stream stays open and finds new runs by notice, not by polling."""
+
+    async def test_new_run_is_found_by_notice_without_a_db_poll(self, manager: BrokerManager) -> None:
+        rows: list[tuple[str, str | None, str | None, datetime | None]] = []
+        reads = 0
+
+        async def lister() -> list[tuple[str, str | None, str | None, datetime | None]]:
+            nonlocal reads
+            reads += 1
+            return list(rows)
+
+        session = ThreadEventSession(
+            "t1",
+            channels={"values", "lifecycle"},
+            list_run_ids=lister,
+            discovery_fallback_seconds=30.0,
+        )
+        received: list[dict[str, Any]] = []
+
+        async def consume() -> None:
+            async for event in session.stream():
+                received.append(event)
+                if event["method"] == "lifecycle" and event["params"]["data"].get("event") == "completed":
+                    return
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.2)
+        assert reads == 1  # opened, read once, now idle without polling
+        await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
+        rows.append(("run-1", "running", None, None))
+        await manager.notify_thread("t1")
+        await asyncio.wait_for(task, timeout=2.0)
+        assert reads == 2
+        assert [e["method"] for e in received] == ["lifecycle", "values", "lifecycle"]
+
+    async def test_idle_stream_does_not_close_by_itself(self, manager: BrokerManager) -> None:
+        session = ThreadEventSession(
+            "t1", channels={"lifecycle"}, list_run_ids=_lister(), discovery_fallback_seconds=0.05
+        )
+        stream = session.stream()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(stream.__anext__(), timeout=0.4)
+        await stream.aclose()

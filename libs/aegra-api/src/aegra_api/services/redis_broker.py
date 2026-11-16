@@ -1,8 +1,13 @@
 """Redis-backed broker for multi-instance SSE streaming.
 
-Uses Redis pub/sub for live event broadcast and Redis Lists for replay storage.
-The replay buffer (Redis List) stores resumable events with a TTL so they
-auto-expire without a cleanup loop. On reconnect, LRANGE fetches missed events.
+Uses Redis pub/sub for live event broadcast and a Redis Stream plus a hash
+for replay storage, both with a TTL so they expire without a cleanup loop.
+
+The stream holds every resumable event except a v2 run's full-state
+``values``, keyed ``<ordinal>-0`` by the event's per-run ordinal, so a
+reconnect XRANGEs from its cursor in bounded batches instead of loading the
+whole buffer. The hash keeps only the newest ``values`` per namespace
+(``replay_policy.snapshot_slot``): the baseline a new subscriber needs.
 
 Event sequence counters are stored as Redis INCR keys for O(1) cross-instance
 access (instead of deriving from the replay buffer with O(N) LRANGE).
@@ -24,6 +29,7 @@ from aegra_api.core.redis_manager import redis_manager
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import REPLAY_RETENTION_SECONDS, BaseBrokerManager, BaseRunBroker
+from aegra_api.services.replay_policy import is_after, merge_replay, ordered_ordinal, snapshot_slot
 from aegra_api.settings import settings
 from aegra_api.utils import generate_event_id
 
@@ -34,8 +40,10 @@ _serializer = GeneralSerializer()
 # Every write refreshes the TTL, so the buffer expires this long after the last
 # event, matching the in-memory post-completion window.
 _REPLAY_TTL_SECONDS = REPLAY_RETENTION_SECONDS
-# Max events in the replay buffer (prevents unbounded growth)
+# Max events in the replay stream (prevents unbounded growth)
 _REPLAY_MAX_EVENTS = 10_000
+# Events read per XRANGE call while replaying.
+_REPLAY_BATCH = 200
 
 # Reconnect backoff for Redis pub/sub listeners
 _BACKOFF_BASE = 0.5
@@ -74,17 +82,21 @@ def _backoff_delay(attempt: int) -> float:
 
 
 class RedisRunBroker(BaseRunBroker):
-    """Broker for a single run backed by Redis pub/sub + Redis Lists.
+    """Broker for a single run backed by Redis pub/sub + a Redis Stream.
 
-    Producer: RPUSH to list (replay buffer) + PUBLISH to channel (live).
-    Consumer: LRANGE for replay, then SUBSCRIBE for live events.
+    Producer: XADD to the stream (or HSET a values snapshot) + PUBLISH (live).
+    Consumer: XRANGE from the cursor for replay, then SUBSCRIBE for live events.
     """
 
     def __init__(self, run_id: str, channel: str, cache_key: str, counter_key: str) -> None:
         self.run_id = run_id
         self._channel = channel
         self._cache_key = cache_key
+        self._snapshot_key = f"{cache_key}:snapshots"
         self._counter_key = counter_key
+        # Last stream ordinal this producer wrote, so an event whose id has no
+        # usable ordinal still lands after it (``<last>-*``), not at the end.
+        self._last_ordinal = 0
         self._finished = False
         # Serializes writes for this run so concurrent put() calls (e.g. a
         # cancel/error signal racing a stream write) keep cache-then-publish
@@ -111,6 +123,7 @@ class RedisRunBroker(BaseRunBroker):
                 "payload": json.loads(_serialize_payload(payload)),
             }
         )
+        slot = snapshot_slot(payload)
 
         is_end = isinstance(payload, tuple) and len(payload) >= 1 and payload[0] == "end"
 
@@ -121,7 +134,10 @@ class RedisRunBroker(BaseRunBroker):
             operation = "cache"
             try:
                 if resumable:
-                    await self._write_with_retry(self._cache_event, message)
+                    if slot is not None:
+                        await self._write_with_retry(lambda m: self._cache_snapshot(slot, m), message)
+                    else:
+                        await self._write_with_retry(lambda m: self._cache_event(event_id, m), message)
 
                 operation = "publish"
                 await self._write_with_retry(self._publish_event, message)
@@ -137,14 +153,38 @@ class RedisRunBroker(BaseRunBroker):
                 if is_end:
                     self._finished = True
 
-    async def _cache_event(self, message: str) -> None:
-        """Append the event to the replay buffer and bump the sequence counter."""
+    async def _cache_event(self, event_id: str, message: str) -> None:
+        """Append the event to the replay stream under its ordinal.
+
+        The entry id is ``<ordinal>-0``, so XRANGE can start right after a
+        cursor. A retried write that Redis already applied is rejected as a
+        non-increasing id, which is the duplicate we want to drop.
+        """
+        ordinal = ordered_ordinal(event_id)
+        entry_id = f"{ordinal}-0" if ordinal is not None else f"{self._last_ordinal}-*"
         client = redis_manager.get_client()
         pipe = client.pipeline()
-        pipe.rpush(self._cache_key, message)
-        pipe.ltrim(self._cache_key, -_REPLAY_MAX_EVENTS, -1)
+        pipe.xadd(self._cache_key, {"m": message}, id=entry_id, maxlen=_REPLAY_MAX_EVENTS, approximate=True)
         pipe.expire(self._cache_key, _REPLAY_TTL_SECONDS)
-        pipe.incr(self._counter_key)
+        pipe.expire(self._snapshot_key, _REPLAY_TTL_SECONDS)
+        pipe.expire(self._counter_key, _REPLAY_TTL_SECONDS)
+        try:
+            await pipe.execute()
+        except RedisError as e:
+            if "equal or smaller" in str(e):
+                logger.debug("Dropped a replayed stream write", run_id=self.run_id, event_id=event_id)
+                return
+            raise
+        if ordinal is not None:
+            self._last_ordinal = max(self._last_ordinal, ordinal)
+
+    async def _cache_snapshot(self, slot: str, message: str) -> None:
+        """Overwrite the namespace's latest full-state values snapshot."""
+        client = redis_manager.get_client()
+        pipe = client.pipeline()
+        pipe.hset(self._snapshot_key, slot, message)
+        pipe.expire(self._snapshot_key, _REPLAY_TTL_SECONDS)
+        pipe.expire(self._cache_key, _REPLAY_TTL_SECONDS)
         pipe.expire(self._counter_key, _REPLAY_TTL_SECONDS)
         await pipe.execute()
 
@@ -250,9 +290,9 @@ class RedisRunBroker(BaseRunBroker):
         """
         try:
             client = redis_manager.get_client()
-            raw_messages = await client.lrange(self._cache_key, -1, -1)  # type: ignore[invalid-await]
-            if raw_messages:
-                data = json.loads(raw_messages[0])
+            entries = await client.xrevrange(self._cache_key, count=1)
+            if entries:
+                data = json.loads(entries[0][1]["m"])
                 payload = _deserialize_payload(data["payload"])
                 if isinstance(payload, tuple) and len(payload) >= 1 and payload[0] == "end":
                     self._finished = True
@@ -262,48 +302,68 @@ class RedisRunBroker(BaseRunBroker):
         return False
 
     async def replay(self, last_event_id: str | None) -> list[tuple[str, Any]]:
+        """Events after *last_event_id*: the latest values snapshots, then the log.
+
+        Snapshots older than the cursor are skipped, so a reconnect that has
+        already seen the newest state does not get it again.
+        """
+        replayed: list[tuple[str, Any]] = []
+        async for event_id, payload in self.replay_iter(last_event_id):
+            replayed.append((event_id, payload))
+        return replayed
+
+    async def replay_iter(self, last_event_id: str | None) -> AsyncIterator[tuple[str, Any]]:
+        """Stream the replay in XRANGE batches instead of loading it at once.
+
+        The latest values snapshot of each namespace is merged in at its own
+        position, so the consumer sees the same order the producer wrote.
+        """
         try:
             client = redis_manager.get_client()
-            raw_messages = await client.lrange(self._cache_key, 0, _REPLAY_MAX_EVENTS - 1)  # type: ignore[invalid-await]
+            raw_snapshots = await client.hvals(self._snapshot_key)  # type: ignore[invalid-await]
         except RedisError as e:
             logger.error(f"Redis replay failed for run {self.run_id}: {e}")
-            return []
-
-        if not raw_messages:
-            return []
-
-        all_events: list[tuple[str, Any]] = []
-        events_after: list[tuple[str, Any]] = []
-        found_last = last_event_id is None
-        prev_event_id: str | None = None
-        for raw in raw_messages:
+            return
+        snapshots: list[tuple[str, Any]] = []
+        for raw in raw_snapshots:
             data = json.loads(raw)
-            event_id: str = data["event_id"]
+            if is_after(data["event_id"], last_event_id):
+                snapshots.append((data["event_id"], _deserialize_payload(data["payload"])))
+        snapshots.sort(key=lambda item: ordered_ordinal(item[0]) or 0)
 
-            # Skip an adjacent duplicate: put() retries are at-least-once, so a
-            # write that timed out *after* Redis applied it can RPUSH the same
-            # event twice. The per-run write lock keeps the copies adjacent, and
-            # event_ids are unique per event, so dropping a run of equal ids is
-            # safe and removes the duplicate from replay.
-            if event_id == prev_event_id:
-                continue
-            prev_event_id = event_id
-
-            payload = _deserialize_payload(data["payload"])
-            all_events.append((event_id, payload))
-
-            if not found_last:
-                if event_id == last_event_id:
-                    found_last = True
-                continue
-
-            events_after.append((event_id, payload))
-
-        # If last_event_id was not found in the buffer, return all events
-        if not found_last:
-            return all_events
-
-        return events_after
+        start = "-"
+        if last_event_id is not None and (cursor := ordered_ordinal(last_event_id)) is not None:
+            # Exclusive of the cursor and of any fallback-id entries written as <cursor>-N.
+            start = f"({cursor}-18446744073709551615"
+        prev_event_id: str | None = None
+        while True:
+            try:
+                entries = await client.xrange(self._cache_key, min=start, max="+", count=_REPLAY_BATCH)
+            except RedisError as e:
+                logger.error(f"Redis replay failed for run {self.run_id}: {e}")
+                return
+            batch: list[tuple[str, Any]] = []
+            for _entry_id, fields in entries:
+                data = json.loads(fields["m"])
+                event_id: str = data["event_id"]
+                if event_id == prev_event_id:
+                    continue
+                prev_event_id = event_id
+                batch.append((event_id, _deserialize_payload(data["payload"])))
+            last_ordinal = next((o for e, _ in reversed(batch) if (o := ordered_ordinal(e)) is not None), None)
+            due = [
+                snap
+                for snap in snapshots
+                if last_ordinal is not None and (ordered_ordinal(snap[0]) or 0) < last_ordinal
+            ]
+            snapshots = snapshots[len(due) :]
+            for event_id, payload in merge_replay(due, batch):
+                yield event_id, payload
+            if len(entries) < _REPLAY_BATCH:
+                break
+            start = f"({entries[-1][0]}"
+        for event_id, payload in snapshots:
+            yield event_id, payload
 
     def mark_finished(self) -> None:
         self._finished = True
@@ -327,6 +387,7 @@ class RedisBrokerManager(BaseBrokerManager):
         self._cache_prefix = f"{self._channel_prefix}cache:"
         self._counter_prefix = f"{self._channel_prefix}counter:"
         self._cancel_channel = f"{self._channel_prefix}cancel"
+        self._thread_channel = f"{self._channel_prefix}thread-runs"
         self._listener_task: asyncio.Task[None] | None = None
         self._running: bool = False
 
@@ -400,6 +461,16 @@ class RedisBrokerManager(BaseBrokerManager):
             # we can still cancel it even if Redis publish fails.
             await self._execute_cancel(run_id, emit_end_event=emit_end_event)
 
+    async def notify_thread(self, thread_id: str) -> None:
+        """Broadcast that a run was created on *thread_id* to every instance."""
+        self._wake_thread(thread_id)
+        try:
+            client = redis_manager.get_client()
+            await client.publish(self._thread_channel, thread_id)
+        except RedisError as e:
+            # Stream sessions still find the run on their periodic fallback read.
+            logger.warning(f"Failed to publish thread run notice for {thread_id}: {e}")
+
     async def get_event_sequence(self, run_id: str) -> int:
         """Read the current event sequence counter from Redis (O(1) GET)."""
         try:
@@ -451,7 +522,7 @@ class RedisBrokerManager(BaseBrokerManager):
         """Subscribe to cancel channel and process commands until stopped."""
         client = redis_manager.get_client()
         pubsub = client.pubsub()
-        await pubsub.subscribe(self._cancel_channel)
+        await pubsub.subscribe(self._cancel_channel, self._thread_channel)
 
         try:
             while self._running:
@@ -463,6 +534,9 @@ class RedisBrokerManager(BaseBrokerManager):
                     continue
                 if message["type"] != "message":
                     continue
+                if message.get("channel") == self._thread_channel:
+                    self._wake_thread(str(message["data"]))
+                    continue
 
                 try:
                     data = json.loads(message["data"])
@@ -473,7 +547,7 @@ class RedisBrokerManager(BaseBrokerManager):
                 except (json.JSONDecodeError, KeyError, ValueError) as e:
                     logger.warning(f"Invalid cancel message: {e}")
         finally:
-            await pubsub.unsubscribe(self._cancel_channel)
+            await pubsub.unsubscribe(self._cancel_channel, self._thread_channel)
             await pubsub.aclose()
 
     async def _execute_cancel(self, run_id: str, *, emit_end_event: bool = True) -> None:

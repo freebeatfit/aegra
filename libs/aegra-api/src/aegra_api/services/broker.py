@@ -14,6 +14,7 @@ import structlog
 from aegra_api.core.active_runs import active_runs
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import REPLAY_RETENTION_SECONDS, BaseBrokerManager, BaseRunBroker
+from aegra_api.services.replay_policy import event_ordinal, is_after, merge_replay, snapshot_slot
 from aegra_api.settings import settings
 from aegra_api.utils import generate_event_id
 
@@ -36,6 +37,8 @@ class RunBroker(BaseRunBroker):
         self.run_id = run_id
         self.finished = asyncio.Event()
         self._replay_buffer: list[tuple[str, Any]] = []
+        # Latest v2 full-state values per namespace (see replay_policy).
+        self._snapshots: dict[str, tuple[str, Any]] = {}
         self._subscribers: set[asyncio.Queue[tuple[str, Any]]] = set()
         self._created_at = asyncio.get_running_loop().time()
         self._finished_at: float | None = None
@@ -46,7 +49,11 @@ class RunBroker(BaseRunBroker):
             return
 
         if resumable:
-            self._replay_buffer.append((event_id, payload))
+            slot = snapshot_slot(payload)
+            if slot is None:
+                self._replay_buffer.append((event_id, payload))
+            else:
+                self._snapshots[slot] = (event_id, payload)
 
         for queue in list(self._subscribers):
             queue.put_nowait((event_id, payload))
@@ -61,7 +68,7 @@ class RunBroker(BaseRunBroker):
         # between a caller's separate replay() and this registration is still in
         # the buffer, so nothing is dropped. Callers dedup the overlap by event_id.
         self._subscribers.add(queue)
-        backlog = list(self._replay_buffer)
+        backlog = merge_replay(list(self._snapshots.values()), list(self._replay_buffer))
         try:
             for event_id, payload in backlog:
                 yield event_id, payload
@@ -81,19 +88,21 @@ class RunBroker(BaseRunBroker):
             self._subscribers.discard(queue)
 
     async def replay(self, last_event_id: str | None) -> list[tuple[str, Any]]:
-        if not self._replay_buffer:
-            return []
-
+        backlog = merge_replay(list(self._snapshots.values()), list(self._replay_buffer))
         if last_event_id is None:
-            return list(self._replay_buffer)
-
-        # Find the index after last_event_id
-        for i, (eid, _) in enumerate(self._replay_buffer):
+            return backlog
+        for i, (eid, _) in enumerate(backlog):
             if eid == last_event_id:
-                return list(self._replay_buffer[i + 1 :])
+                return backlog[i + 1 :]
+        # The cursor may be a values snapshot that a newer one overwrote:
+        # compare allocation order. Ids without an ordinal replay everything.
+        if event_ordinal(last_event_id) > 0:
+            return [(eid, payload) for eid, payload in backlog if is_after(eid, last_event_id)]
+        return backlog
 
-        # last_event_id not found — return all
-        return list(self._replay_buffer)
+    async def replay_iter(self, last_event_id: str | None) -> AsyncIterator[tuple[str, Any]]:
+        for item in await self.replay(last_event_id):
+            yield item
 
     def mark_finished(self) -> None:
         if self.finished.is_set():
