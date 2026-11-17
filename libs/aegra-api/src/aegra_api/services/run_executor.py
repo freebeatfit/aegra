@@ -51,9 +51,7 @@ async def execute_run(job: RunJob) -> None:
             return
 
         final_output = await _stream_graph(job)
-        # A run's state lives in its checkpoint; the LangGraph Agent Server
-        # stores no run output and join/wait read the thread's values on demand
-        # (run_waiters).
+        # No run output, as the Agent Server: join/wait read the thread's values (run_waiters).
 
         if final_output.has_interrupt:
             finalized = await finalize_run(

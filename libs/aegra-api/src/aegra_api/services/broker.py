@@ -94,7 +94,7 @@ class BrokerManager(BaseBrokerManager):
         return True
 
     async def put_snapshot(
-        self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+        self, thread_id: str, *, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
     ) -> bool:
         log = self._log(thread_id)
         marker = log.write(run_id, write_id, (SNAPSHOT_MARKER, namespace))

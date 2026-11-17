@@ -72,9 +72,8 @@ class RedisManager:
         )
         self._blocking_client = aioredis.Redis(connection_pool=self._blocking_pool)
 
-        # One connection per open thread stream, as the LangGraph Agent Server does. The pool
-        # waits when exhausted instead of raising, so overload adds latency, not errors. A
-        # retried XREAD re-reads from the same cursor, so a dropped connection loses nothing.
+        # One connection per open thread stream, as the Agent Server does; a full pool waits
+        # (latency, not errors), and a retried XREAD re-reads from the same cursor.
         self._stream_read_pool = aioredis.BlockingConnectionPool.from_url(
             settings.redis.REDIS_URL,
             max_connections=settings.redis.REDIS_STREAM_READ_MAX_CONNECTIONS,

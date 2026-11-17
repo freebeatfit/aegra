@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
+from sqlalchemy.exc import OperationalError
 
 from aegra_api.services import run_waiters
 from aegra_api.services.run_waiters import run_result_body, thread_values_for
@@ -56,15 +57,26 @@ class TestThreadValuesFor:
         session_cm.__aexit__ = AsyncMock(return_value=False)
         with (
             patch.object(run_waiters, "_get_session_maker", return_value=lambda: session_cm),
-            patch("aegra_api.services.langgraph_service.get_langgraph_service", return_value=service),
+            patch.object(run_waiters, "get_langgraph_service", return_value=service),
         ):
             values = await thread_values_for(_run(), SimpleNamespace(identity="u1", permissions=[]))
         assert values == {"messages": ["m"]}
         assert service.get_graph.call_args.args[0] == "graph-1"
 
     async def test_a_failed_read_falls_back_to_none(self) -> None:
-        with patch.object(run_waiters, "_get_session_maker", side_effect=RuntimeError("db down")):
+        with patch.object(run_waiters, "_get_session_maker", side_effect=OperationalError("select", {}, Exception())):
             assert await thread_values_for(_run(), MagicMock()) is None
+
+    async def test_a_graph_that_no_longer_loads_falls_back_to_none(self) -> None:
+        with patch.object(run_waiters, "_thread_state", AsyncMock(side_effect=ValueError("Graph not found: g"))):
+            assert await thread_values_for(_run(), MagicMock()) is None
+
+    async def test_an_unexpected_error_is_not_swallowed(self) -> None:
+        with (
+            patch.object(run_waiters, "_thread_state", AsyncMock(side_effect=RuntimeError("bug"))),
+            pytest.raises(RuntimeError),
+        ):
+            await thread_values_for(_run(), MagicMock())
 
 
 class TestEncodeOutput:

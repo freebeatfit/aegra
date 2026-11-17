@@ -122,7 +122,7 @@ async def test_a_snapshot_and_its_marker_land_together_and_the_root_marker_is_ne
 ) -> None:
     monkeypatch.setattr(settings.event_streaming, "RESUMABLE_STREAM_TTL_SECONDS", 1)
     record = {"run_id": "run-1", "checkpoint": None, "values": {"params": {"data": {"a": 1}}}}
-    await manager.put_snapshot("t-1", "run-1", "w0", "[]", record)
+    await manager.put_snapshot("t-1", run_id="run-1", write_id="w0", namespace="[]", record=record)
     for i in range(300):
         await manager.append("t-1", "run-1", f"w{i}", ("messages", {"i": i}))
         await asyncio.sleep(0.007)
@@ -138,7 +138,13 @@ async def test_a_snapshot_and_its_marker_land_together_and_the_root_marker_is_ne
 
 async def test_each_entry_stores_a_seq_that_rises_by_the_stride(manager: RedisBrokerManager) -> None:
     await manager.append("t-1", "run-1", "w1", ("updates", {"a": 1}))
-    await manager.put_snapshot("t-1", "run-1", "w2", "[]", {"run_id": "run-1", "checkpoint": None, "values": {}})
+    await manager.put_snapshot(
+        "t-1",
+        run_id="run-1",
+        write_id="w2",
+        namespace="[]",
+        record={"run_id": "run-1", "checkpoint": None, "values": {}},
+    )
 
     entries = await manager.read_thread("t-1", "0-0")
     [(marker_id, seq, _record)] = (await manager.read_snapshots("t-1", ["[]"])).values()

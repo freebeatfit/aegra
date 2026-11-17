@@ -118,7 +118,7 @@ def rest(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[TestClient, str]]:
         )
 
     service = _GraphService()
-    for module in ("run_preparation", "run_executor", "langgraph_service"):
+    for module in ("run_preparation", "run_executor", "langgraph_service", "run_waiters"):
         monkeypatch.setattr(f"aegra_api.services.{module}.get_langgraph_service", lambda: service)
     # NullPool: TestClient runs the app on its own loop; asyncpg connections can't cross loops.
     engine = create_async_engine(settings.db.database_url, poolclass=NullPool)

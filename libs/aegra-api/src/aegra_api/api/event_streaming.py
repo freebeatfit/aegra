@@ -17,7 +17,9 @@ import anyio
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from redis import RedisError
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import EventSourceResponse
 
@@ -178,7 +180,8 @@ async def _frame_events(session_stream: ThreadEventSession) -> AsyncGenerator[st
     try:
         async for envelope in session_stream.stream():
             yield format_sse_message(envelope["method"], envelope, str(envelope["seq"]))
-    except Exception:
+    # Log reads, run lookups and stored-entry decoding; anything else is a bug and propagates.
+    except (RedisError, OSError, SQLAlchemyError, ValueError, KeyError):
         logger.exception("Thread event stream failed")
         yield format_sse_message("error", _THREAD_STREAM_FAILED)
 

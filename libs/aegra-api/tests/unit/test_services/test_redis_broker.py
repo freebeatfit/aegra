@@ -101,7 +101,9 @@ class TestAppend:
 
         with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
             mock_rm.get_client.return_value = client
-            await manager.put_snapshot("t-1", "run-1", "w1", "[]", {"values": {"a": 1}})
+            await manager.put_snapshot(
+                "t-1", run_id="run-1", write_id="w1", namespace="[]", record={"values": {"a": 1}}
+            )
 
         _, kwargs = client.register_script.return_value.call_args
         assert kwargs["keys"] == _KEYS

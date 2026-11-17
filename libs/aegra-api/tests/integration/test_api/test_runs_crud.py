@@ -539,12 +539,14 @@ class TestJoinRun:
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
+        with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())),
+            patch("aegra_api.api.runs.thread_values_for", AsyncMock(return_value={"messages": ["m"]})),
+        ):
             resp = client.get("/threads/test-thread-123/runs/test-run-123/join")
 
         assert resp.status_code == 200
-        # Response may vary depending on run state
-        assert isinstance(resp.json(), (dict, list))
+        assert resp.json() == {"messages": ["m"]}
 
 
 class TestRunWithInput:

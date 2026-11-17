@@ -151,7 +151,11 @@ class RunBroker:
             "checkpoint": None if checkpoint is None else checkpoint[1],
             "values": values[1],
         }
-        self._count(await self._manager.put_snapshot(self.thread_id, self.run_id, uuid4().hex, namespace, record))
+        self._count(
+            await self._manager.put_snapshot(
+                self.thread_id, run_id=self.run_id, write_id=uuid4().hex, namespace=namespace, record=record
+            )
+        )
 
     def _skip(self, *, terminal: bool) -> bool:
         """After a lost write, drop the run's later events (as the Agent Server does) but still try its terminal."""
@@ -210,7 +214,7 @@ class BaseBrokerManager(ABC):
 
     @abstractmethod
     async def put_snapshot(
-        self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+        self, thread_id: str, *, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
     ) -> bool:
         """Replace *namespace*'s snapshot with *record* and append its marker, in one atomic write.
 

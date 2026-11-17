@@ -82,6 +82,21 @@ async def test_idle_stream_whose_client_stopped_reading_ends_at_the_send_timeout
 
 
 @pytest.mark.asyncio
+async def test_a_bug_in_the_stream_is_not_reported_as_a_failed_read(
+    local_broker_manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def buggy_read(_thread_id: str, _after: str) -> list[ThreadEntry]:
+        raise TypeError("bug")
+
+    monkeypatch.setattr(local_broker_manager, "read_thread", buggy_read)
+    session = ThreadEventSession(str(uuid4()), channels={"lifecycle"}, lookup_run=_visible)
+
+    with pytest.raises(TypeError):
+        async for _frame in _frame_events(session):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_failed_read_sends_the_error_event_and_ends(
     local_broker_manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
 ) -> None:

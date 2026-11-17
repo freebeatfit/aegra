@@ -53,10 +53,8 @@ _PUT_MAX_ATTEMPTS = 3
 # The seq counter outlives the stream window by far, so seq never goes back after the stream expires.
 _SEQ_TTL_SECONDS = 24 * 3600
 
-# One atomic write per event; the keys share the thread's hash tag (one Cluster slot). A script, not MULTI,
-# so a snapshot records its marker's id, the time trim stops at the root snapshot's marker, and a
-# subgraph snapshot whose marker was trimmed goes with it.
-# ARGV: window ms, TTL s, run id, write id, namespace ("" for a plain event), payload, seq TTL s.
+# One atomic write per event on keys sharing the thread's hash tag; a script, not MULTI, because seq, the
+# marker id and the trim bound each depend on what Redis holds. ARGV: see _write.
 _WRITE_SCRIPT = f"""
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
@@ -170,15 +168,20 @@ class RedisBrokerManager(BaseBrokerManager):
         return _ThreadKeys(f"{base}:events", f"{base}:snapshot-ids", f"{base}:snapshots", f"{base}:seq")
 
     async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> bool:
-        return await self._write(thread_id, run_id, write_id, "", _serialize_payload(event))
+        return await self._write(
+            thread_id, run_id=run_id, write_id=write_id, namespace="", payload=_serialize_payload(event)
+        )
 
     async def put_snapshot(
-        self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+        self, thread_id: str, *, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
     ) -> bool:
-        return await self._write(thread_id, run_id, write_id, namespace, _serialize_payload(record))
+        return await self._write(
+            thread_id, run_id=run_id, write_id=write_id, namespace=namespace, payload=_serialize_payload(record)
+        )
 
-    async def _write(self, thread_id: str, run_id: str, write_id: str, namespace: str, payload: str) -> bool:
+    async def _write(self, thread_id: str, *, run_id: str, write_id: str, namespace: str, payload: str) -> bool:
         window = settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
+        # namespace "" is a plain event; otherwise payload is that namespace's snapshot record.
         args = [window * 1000, window, run_id, write_id, namespace, payload, _SEQ_TTL_SECONDS]
         attempt = 0
         while True:

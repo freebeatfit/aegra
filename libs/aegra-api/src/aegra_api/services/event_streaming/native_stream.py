@@ -136,10 +136,8 @@ async def stream_native_v3_events(
         **breakpoints,
         **durability_kwargs,
     )
-    # LangGraph Python emits a step's values, then that step's checkpoint. The
-    # protocol (and LangGraph JS) put the envelope immediately before its
-    # companion values, and the SDK pairs a buffered envelope with the next
-    # values. Hold one values event until we see whether its checkpoint follows.
+    # LangGraph Python emits values then their checkpoint; the protocol and SDK expect the
+    # envelope first, so hold one values event until we see whether its checkpoint follows.
     held: tuple[str, dict[str, Any]] | None = None
     async with run_stream as stream:
         async for event in stream:

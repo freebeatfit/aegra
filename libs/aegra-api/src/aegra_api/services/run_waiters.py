@@ -12,12 +12,16 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import structlog
+from psycopg import Error as PsycopgError
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
+from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.services.executor import executor
+from aegra_api.services.langgraph_service import create_thread_config, get_langgraph_service
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -101,26 +105,29 @@ async def thread_values_for(run_orm: RunORM | None, user: Any) -> dict[str, Any]
     if run_orm is None or run_orm.output or run_orm.status not in _STATES_WITH_OUTPUT:
         return None
     try:
-        from aegra_api.core.orm import Assistant as AssistantORM
-        from aegra_api.services.langgraph_service import create_thread_config, get_langgraph_service
-
-        maker = _get_session_maker()
-        async with maker() as session:
-            graph_id = await session.scalar(
-                select(AssistantORM.graph_id).where(AssistantORM.assistant_id == run_orm.assistant_id)
-            )
-        if not graph_id:
-            return None
-        config = create_thread_config(run_orm.thread_id, user)
-        async with get_langgraph_service().get_graph(
-            graph_id, config=config, access_context="threads.read", user=user
-        ) as graph:
-            snapshot = await graph.aget_state(config)
-        values = getattr(snapshot, "values", None)
-        return values if isinstance(values, dict) else None
-    except Exception:
+        snapshot = await _thread_state(run_orm, user)
+    except (SQLAlchemyError, PsycopgError, ValueError):
+        # A missing graph (ValueError) or a DB error: the caller answers with the run row alone.
         logger.warning("Could not read thread values for a run result", run_id=run_orm.run_id, exc_info=True)
         return None
+    values = getattr(snapshot, "values", None)
+    return values if isinstance(values, dict) else None
+
+
+async def _thread_state(run_orm: RunORM, user: Any) -> Any:
+    """The thread's current state through the run's graph, or None when its assistant is gone."""
+    maker = _get_session_maker()
+    async with maker() as session:
+        graph_id = await session.scalar(
+            select(AssistantORM.graph_id).where(AssistantORM.assistant_id == run_orm.assistant_id)
+        )
+    if not graph_id:
+        return None
+    config = create_thread_config(run_orm.thread_id, user)
+    async with get_langgraph_service().get_graph(
+        graph_id, config=config, access_context="threads.read", user=user
+    ) as graph:
+        return await graph.aget_state(config)
 
 
 _serializer = GeneralSerializer()
