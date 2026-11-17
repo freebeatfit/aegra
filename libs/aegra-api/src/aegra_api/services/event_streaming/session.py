@@ -5,7 +5,7 @@ the client opens the stream, issues ``run.start``, and the events of whatever
 run(s) execute on the thread flow through. Every run on the thread appends its
 native protocol events (the v3 producer wrote them) as ``(method, event)``
 pairs, plus a terminal ``("end"|"error", payload)``, to one event log per
-thread; a ``values`` event without interrupts instead replaces its namespace's
+thread; a ``values`` event, interrupts included, instead replaces its namespace's
 snapshot (stored with its checkpoint envelope) and appends a marker. The session
 replays, per requested namespace, the latest snapshot, then the log from the
 earliest of those snapshots' markers, then reads on with bounded blocking reads

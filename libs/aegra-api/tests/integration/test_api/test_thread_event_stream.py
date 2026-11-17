@@ -479,8 +479,10 @@ def _wire(event: dict[str, Any]) -> tuple[Any, ...]:
     return event["event_id"], event["seq"], event["method"], params["namespace"], params["data"], timestamp
 
 
-async def _run_to_end(server: _Server, http: httpx.AsyncClient, thread_id: str, text: str) -> _Stream:
-    async with _open(http, thread_id, _STATE_CHANNELS) as live:
+async def _run_to_end(
+    server: _Server, http: httpx.AsyncClient, thread_id: str, text: str, channels: list[str] = _STATE_CHANNELS
+) -> _Stream:
+    async with _open(http, thread_id, channels) as live:
         run_id = await server.start_run(http, thread_id, text)
         await live.read_until(
             lambda stream: any(
@@ -651,16 +653,20 @@ async def test_reconnect_bytes_do_not_grow_with_the_number_of_steps(stream_serve
 
 
 @pytest.mark.asyncio
-async def test_interrupt_reaches_a_client_that_reconnects(stream_server: _Server) -> None:
+async def test_interrupt_reaches_a_live_reader_and_a_client_that_reconnects(stream_server: _Server) -> None:
     thread_id = str(uuid4())
     async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
-        await _run_to_end(stream_server, http, thread_id, "ask:x")
+        live = await _run_to_end(stream_server, http, thread_id, "ask:" + "x" * 20000, ["values", "input", "lifecycle"])
         fresh = await _reconnect(http, thread_id, ["values", "input", "lifecycle"])
 
-    requests = [e["params"]["data"] for e in fresh.events if e["method"] == "input.requested"]
-    assert [request["payload"] for request in requests] == ["question?"]
-    assert requests[0]["interrupt_id"]
+    for stream in (live, fresh):
+        requests = [e["params"]["data"] for e in stream.events if e["method"] == "input.requested"]
+        assert [request["payload"] for request in requests] == ["question?"]
+        assert requests[0]["interrupt_id"]
+        assert [status for status, _ in _root_lifecycle(stream)][-1] == "interrupted"
     assert [status for status, _ in _root_lifecycle(fresh)] == ["running", "interrupted"]
+    # Parked on the interrupt, Redis holds the thread's state once: the snapshot, not an interrupt delta too.
+    assert sum("x" * 20000 in value for value in _thread_values(stream_server)) == 1
 
 
 def _run_status(run_id: str) -> str | None:

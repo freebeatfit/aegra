@@ -45,8 +45,12 @@ class TestRunBroker:
         assert [event for *_rest, event in entries] == [(SNAPSHOT_MARKER, "[]"), (SNAPSHOT_MARKER, "[]")]
         assert await manager.read_snapshot_ids("t1") == {"[]": entries[1][0]}
         snapshots = await manager.read_snapshots("t1", ["[]", '["sub"]'])
+        # The second values came without an envelope, so it keeps the namespace's last one.
         assert snapshots == {
-            "[]": (entries[1][0], {"run_id": "run-1", "checkpoint": None, "values": _event("values", {"a": 2})[1]})
+            "[]": (
+                entries[1][0],
+                {"run_id": "run-1", "checkpoint": checkpoint[1], "values": _event("values", {"a": 2})[1]},
+            )
         }
 
     @pytest.mark.asyncio
@@ -62,18 +66,41 @@ class TestRunBroker:
         assert record == {"run_id": "run-1", "checkpoint": checkpoint[1], "values": values[1]}
 
     @pytest.mark.asyncio
-    async def test_values_with_interrupts_and_unpaired_envelopes_stay_in_the_log(self) -> None:
+    async def test_values_with_interrupts_replace_the_snapshot_with_the_namespaces_last_envelope(self) -> None:
+        """LangGraph restates the last step's state with its interrupts and sends no new envelope for it."""
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1", "t1")
+        checkpoint, values = _event("checkpoints", {"id": "c1", "step": 1}), _event("values", {"a": 1})
+        interrupted = _event("values", {"a": 1}, interrupts=[{"id": "i1", "value": "q"}])
+
+        for event in (checkpoint, values, interrupted, ("end", {"status": "interrupted"})):
+            await broker.put(event)
+
+        entries = await manager.read_thread("t1", "0-0")
+        assert [event for *_rest, event in entries] == [
+            (SNAPSHOT_MARKER, "[]"),
+            (SNAPSHOT_MARKER, "[]"),
+            ("end", {"status": "interrupted"}),
+        ]
+        snapshots = await manager.read_snapshots("t1", ["[]"])
+        assert snapshots == {
+            "[]": (entries[1][0], {"run_id": "run-1", "checkpoint": checkpoint[1], "values": interrupted[1]})
+        }
+
+    @pytest.mark.asyncio
+    async def test_envelopes_without_their_values_stay_in_the_log(self) -> None:
         manager = BrokerManager()
         broker = manager.get_or_create_broker("run-1", "t1")
         first, second = _event("checkpoints", {"id": "c1"}), _event("checkpoints", {"id": "c2"}, ["sub"])
         interrupted = _event("values", {"a": 1}, interrupts=[{"id": "i1", "value": "q"}])
 
-        for event in (first, second, interrupted, ("end", {"status": "interrupted"})):
+        for event in (first, second, interrupted):
             await broker.put(event)
 
         entries = await manager.read_thread("t1", "0-0")
-        assert [event for *_rest, event in entries] == [first, second, interrupted, ("end", {"status": "interrupted"})]
-        assert await manager.read_snapshot_ids("t1") == {}
+        assert [event for *_rest, event in entries] == [first, second, (SNAPSHOT_MARKER, "[]")]
+        [(_, record)] = (await manager.read_snapshots("t1", ["[]"])).values()
+        assert record["checkpoint"] is None
 
     @pytest.mark.asyncio
     async def test_end_event_marks_finished_and_later_events_are_dropped(self) -> None:

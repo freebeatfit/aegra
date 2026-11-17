@@ -1051,10 +1051,28 @@ class TestLatestStateReplay:
             ("values", []),
         ]
 
-    async def test_interrupt_values_stay_deltas_after_the_snapshot(self, manager: BrokerManager) -> None:
+    async def test_interrupt_values_are_the_snapshot_and_surface_on_reconnect(self, manager: BrokerManager) -> None:
         interrupted = ("values", _protocol_event("values", {"a": 0}, interrupts=[{"id": "i-1", "value": "q"}]))
         await _publish(manager, "run-1", [*_step(0, {"a": 0}), interrupted, ("end", {"status": "interrupted"})])
 
-        events = await _collect(_make_session("t1", channels={"values", "input", "lifecycle"}))
+        events = await _collect(_make_session("t1", channels={"values", "checkpoints", "input", "lifecycle"}))
 
-        assert [e["method"] for e in events] == ["lifecycle", "values", "input.requested", "values", "lifecycle"]
+        assert _shape(events)[1:] == [
+            ("checkpoints", [], {"id": "c0", "step": 0}),
+            ("input.requested", [], {"interrupt_id": "i-1", "value": "q", "payload": "q"}),
+            ("values", [], {"a": 0}),
+            ("lifecycle", [], {"event": "interrupted"}),
+        ]
+
+    async def test_a_live_reader_gets_the_interrupt_from_the_snapshot(self, live_manager: BrokerManager) -> None:
+        interrupted = ("values", _protocol_event("values", {"a": 0}, interrupts=[{"id": "i-1", "value": "q"}]))
+        session = _make_session("t1", channels={"values", "input", "lifecycle"})
+        reader = asyncio.create_task(_read_until_runs_end(session, 1))
+        await asyncio.sleep(0.1)
+
+        await _publish(live_manager, "run-1", [*_step(0, {"a": 0}), interrupted, ("end", {"status": "interrupted"})])
+        events = await reader
+
+        requested = [e["params"]["data"]["interrupt_id"] for e in events if e["method"] == "input.requested"]
+        assert requested == ["i-1"]
+        assert [e["params"]["data"] for e in events if e["method"] == "values"][-1] == {"a": 0}

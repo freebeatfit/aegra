@@ -5,12 +5,12 @@ order (a Redis Stream when ``REDIS_BROKER_ENABLED=true``, a list in dev mode).
 A thread stream reads the log from its cursor, the entry id, with a bounded
 blocking read, so a run started after the stream opened shows up on it.
 
-Full state is kept once per namespace, not in the log: a ``values`` event (with
-the checkpoint envelope just before it) replaces the namespace's snapshot and
-appends a small marker entry in the same atomic write. ``values`` events that
-carry interrupts stay in the log as deltas. Each write trims log entries older
-than ``RESUMABLE_STREAM_TTL_SECONDS``, but never the root snapshot's marker or
-anything after it, and the thread's keys expire one window after its last write.
+Full state is kept once per namespace, not in the log: every ``values`` event,
+interrupts included, replaces the namespace's snapshot (with its checkpoint
+envelope) and appends a small marker entry in the same atomic write. Each write
+trims log entries older than ``RESUMABLE_STREAM_TTL_SECONDS``, but never the root
+snapshot's marker or anything after it, and the thread's keys expire one window
+after its last write.
 """
 
 import asyncio
@@ -74,17 +74,6 @@ def _namespace(event: Any) -> list[str]:
     return namespace if isinstance(namespace, list) else []
 
 
-def _is_snapshot(event: Any) -> bool:
-    """A ``values`` event without interrupts: it replaces its namespace's snapshot."""
-    params = _params(event)
-    data = params.get("data")
-    return (
-        _method(event) == "values"
-        and not params.get("interrupts")
-        and not (isinstance(data, dict) and "__interrupt__" in data)
-    )
-
-
 class RunBroker:
     """Writes one run's events to its thread's log and remembers that the run ended."""
 
@@ -97,6 +86,8 @@ class RunBroker:
         self._write_lock = asyncio.Lock()
         # A checkpoints event waits for the values it precedes, to be stored with it.
         self._held: Any = None
+        # Each namespace's last stored envelope: values that restate a step (an interrupt) get no new one.
+        self._envelopes: dict[str, Any] = {}
         # Set once a write failed after its retries: later events are dropped, not retried.
         self._lost = False
 
@@ -109,15 +100,14 @@ class RunBroker:
             self._finished = True
         async with self._write_lock:
             held, self._held = self._held, None
-            if _is_snapshot(event) and held is not None and _namespace(held) == _namespace(event):
-                await self._snapshot(held, event)
-                return
-            if held is not None:
+            if _method(event) == "values" and held is not None and _namespace(held) == _namespace(event):
+                self._envelopes[namespace_key(_namespace(event))] = held
+            elif held is not None:
                 await self._append(held)
-            if _method(event) == "checkpoints":
+            if _method(event) == "values":
+                await self._snapshot(event)
+            elif _method(event) == "checkpoints":
                 self._held = event
-            elif _is_snapshot(event):
-                await self._snapshot(None, event)
             else:
                 await self._append(event)
 
@@ -126,15 +116,16 @@ class RunBroker:
             return
         self._count(await self._manager.append(self.thread_id, self.run_id, uuid4().hex, event))
 
-    async def _snapshot(self, checkpoint: Any, values: Any) -> None:
+    async def _snapshot(self, values: Any) -> None:
         if self._skip(terminal=False):
             return
+        namespace = namespace_key(_namespace(values))
+        checkpoint = self._envelopes.get(namespace)
         record = {
             "run_id": self.run_id,
             "checkpoint": None if checkpoint is None else checkpoint[1],
             "values": values[1],
         }
-        namespace = namespace_key(_namespace(values))
         self._count(await self._manager.put_snapshot(self.thread_id, self.run_id, uuid4().hex, namespace, record))
 
     def _skip(self, *, terminal: bool) -> bool:
