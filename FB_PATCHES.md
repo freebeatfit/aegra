@@ -44,12 +44,6 @@ Deviations from the LangGraph Agent Server that remain in P2-P4:
   connection (official: per session).
 - Run lookups use the run row's `user_id`, not custom auth filters.
 
-## Known upstream failures
-
-`tests/integration/test_streaming_errors.py` (3 tests) failed on unmodified
-`v0.11.0` too. P8 removed it with the v1 stream it tested; the `--ignore` for
-it in `fb-release.yml` is now a no-op.
-
 ## Rebasing onto a new upstream release
 
 1. `git fetch upstream --tags && git switch -c fb/<new> v<new>`.

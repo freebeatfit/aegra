@@ -16,7 +16,7 @@ after its last write.
 import asyncio
 import json
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 import structlog
@@ -29,14 +29,26 @@ logger = structlog.getLogger(__name__)
 # Entries returned per read.
 READ_BATCH = 200
 
-# (entry_id, run_id, write_id, event). entry_id is "<ms>-<n>" and rises with
-# every write on the thread; a retried write keeps its write_id. A marker's event
-# is (SNAPSHOT_MARKER, namespace key): its snapshot lives in the thread's snapshots.
-ThreadEntry = tuple[str, str, str, Any]
 SNAPSHOT_MARKER = "snapshot"
-# (marker entry id, record): the record is {"run_id", "checkpoint": envelope event or None, "values": event}.
-Snapshot = tuple[str, dict[str, Any]]
 ROOT_NAMESPACE = "[]"
+
+
+class ThreadEntry(NamedTuple):
+    """One log entry. ``entry_id`` is ``<ms>-<n>`` and rises with every write; a retried write keeps its ``write_id``."""
+
+    entry_id: str
+    run_id: str
+    write_id: str
+    # A marker's event is (SNAPSHOT_MARKER, namespace key): its snapshot lives in the thread's snapshots.
+    event: Any
+
+
+class Snapshot(NamedTuple):
+    """A namespace's latest full state and the id of the marker entry written with it."""
+
+    marker_id: str
+    # {"run_id", "checkpoint": envelope event or None, "values": event}
+    record: dict[str, Any]
 
 
 def namespace_key(namespace: list[str]) -> str:

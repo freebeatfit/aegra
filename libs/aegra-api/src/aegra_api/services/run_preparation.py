@@ -6,7 +6,7 @@ resume-command validation, and config/context merging logic.
 
 import asyncio
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from functools import cache
 from typing import Any
@@ -239,7 +239,7 @@ class InterruptNotPendingError(HTTPException):
         super().__init__(409, detail)
 
 
-async def pending_interrupt_ids(thread_id: str) -> set[str | None]:
+async def _pending_interrupt_ids(thread_id: str) -> set[str | None]:
     """Ids of the interrupts pending on the thread's latest root checkpoint."""
     saved = await db_manager.get_checkpointer().aget_tuple(
         {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
@@ -251,6 +251,13 @@ async def pending_interrupt_ids(thread_id: str) -> set[str | None]:
         if channel == _INTERRUPT_CHANNEL
         for interrupt in (value if isinstance(value, Sequence) else [value])
     }
+
+
+async def non_pending_interrupt_message(thread_id: str, interrupt_ids: Iterable[str]) -> str | None:
+    """Why the first of *interrupt_ids* not pending on the thread can't be answered, or None."""
+    pending = await _pending_interrupt_ids(thread_id)
+    unknown_id = next((interrupt_id for interrupt_id in interrupt_ids if interrupt_id not in pending), None)
+    return None if unknown_id is None else f"Unknown or already-consumed interrupt: {unknown_id}"
 
 
 async def _refuse_if_interrupt_answered(session: AsyncSession, thread_id: str, resume: Any) -> None:
@@ -268,10 +275,9 @@ async def _refuse_if_interrupt_answered(session: AsyncSession, thread_id: str, r
         and all(isinstance(key, str) and INTERRUPT_ID_PATTERN.fullmatch(key) for key in resume)
     ):
         return
-    pending = await pending_interrupt_ids(thread_id)
-    unknown_id = next((interrupt_id for interrupt_id in resume if interrupt_id not in pending), None)
-    if unknown_id is not None:
-        raise InterruptNotPendingError(f"Unknown or already-consumed interrupt: {unknown_id}")
+    message = await non_pending_interrupt_message(thread_id, resume)
+    if message is not None:
+        raise InterruptNotPendingError(message)
 
 
 def _resolve_checkpoint(request: RunCreate) -> dict[str, Any] | None:

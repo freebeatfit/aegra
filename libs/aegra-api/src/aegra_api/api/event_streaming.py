@@ -31,7 +31,7 @@ from aegra_api.models import User
 from aegra_api.models.event_streaming import EventStreamRequest, ThreadCommand
 from aegra_api.services.event_streaming.capabilities import get_v2_capabilities
 from aegra_api.services.event_streaming.commands import handle_command
-from aegra_api.services.event_streaming.session import RunLookup, ThreadEventSession, validate_channels
+from aegra_api.services.event_streaming.session import RunLookup, ThreadEventSession, VisibleRun, validate_channels
 
 logger = structlog.getLogger(__name__)
 
@@ -51,13 +51,13 @@ async def _verify_thread_owned_or_new(session: AsyncSession, thread_id: str, use
 
 
 def _thread_run_lookup(thread_id: str, user: User) -> RunLookup:
-    """Look up a run the stream sees for the first time: its graph name, or None if the caller can't see it.
+    """Look up a run the stream sees for the first time: None if the caller can't see it.
 
     One query per new run id, like the LangGraph Agent Server's run fetch, in a
     short-lived session so no connection is held for the SSE lifetime (#423).
     """
 
-    async def graph_of(run_id: str) -> str | None:
+    async def visible_run(run_id: str) -> VisibleRun | None:
         maker = _get_session_maker()
         # sse-starlette's anyio cancel punches through asyncio.shield (#530).
         with anyio.CancelScope(shield=True):
@@ -69,9 +69,9 @@ def _thread_run_lookup(thread_id: str, user: User) -> RunLookup:
                     .where(RunORM.run_id == run_id, RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
                 )
                 row = result.first()
-        return None if row is None else row[0] or ""
+        return None if row is None else VisibleRun(graph=row[0])
 
-    return graph_of
+    return visible_run
 
 
 def _require_v2_enabled() -> None:

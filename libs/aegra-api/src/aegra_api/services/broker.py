@@ -41,7 +41,7 @@ class _ThreadLog:
     def after(self, key: tuple[int, int]) -> list[ThreadEntry]:
         fresh: list[ThreadEntry] = []
         for entry in reversed(self.entries):
-            if entry_key(entry[0]) <= key:
+            if entry_key(entry.entry_id) <= key:
                 break
             fresh.append(entry)
         fresh.reverse()
@@ -52,20 +52,20 @@ class _ThreadLog:
         ms = time.time_ns() // 1_000_000
         oldest = ms - settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS * 1000
         if root := self.snapshots.get(ROOT_NAMESPACE):
-            oldest = min(oldest, entry_key(root[0])[0])
-        while self.entries and entry_key(self.entries[0][0])[0] < oldest:
+            oldest = min(oldest, entry_key(root.marker_id)[0])
+        while self.entries and entry_key(self.entries[0].entry_id)[0] < oldest:
             self.entries.popleft()
         if self.entries:
-            first = entry_key(self.entries[0][0])
+            first = entry_key(self.entries[0].entry_id)
             self.snapshots = {
                 namespace: snapshot
                 for namespace, snapshot in self.snapshots.items()
-                if namespace == ROOT_NAMESPACE or entry_key(snapshot[0]) >= first
+                if namespace == ROOT_NAMESPACE or entry_key(snapshot.marker_id) >= first
             }
         last_ms, last_n = self.last_key
         self.last_key = (ms, 0) if ms > last_ms else (last_ms, last_n + 1)
         entry_id = f"{self.last_key[0]}-{self.last_key[1]}"
-        self.entries.append((entry_id, run_id, write_id, event))
+        self.entries.append(ThreadEntry(entry_id, run_id, write_id, event))
         self.last_write = time.monotonic()
         written, self.written = self.written, asyncio.Event()
         written.set()
@@ -94,7 +94,7 @@ class BrokerManager(BaseBrokerManager):
         self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
     ) -> bool:
         log = self._log(thread_id)
-        log.snapshots[namespace] = (log.write(run_id, write_id, (SNAPSHOT_MARKER, namespace)), record)
+        log.snapshots[namespace] = Snapshot(log.write(run_id, write_id, (SNAPSHOT_MARKER, namespace)), record)
         return True
 
     async def read_thread(self, thread_id: str, after: str) -> list[ThreadEntry]:
@@ -108,7 +108,7 @@ class BrokerManager(BaseBrokerManager):
         return self._log(thread_id).after(key)
 
     async def read_snapshot_ids(self, thread_id: str) -> dict[str, str]:
-        return {namespace: entry_id for namespace, (entry_id, _) in self._log(thread_id).snapshots.items()}
+        return {namespace: snapshot.marker_id for namespace, snapshot in self._log(thread_id).snapshots.items()}
 
     async def read_snapshots(self, thread_id: str, namespaces: list[str]) -> dict[str, Snapshot]:
         snapshots = self._log(thread_id).snapshots

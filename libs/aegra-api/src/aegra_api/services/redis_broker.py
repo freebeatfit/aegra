@@ -14,7 +14,7 @@ import contextlib
 import json
 import random
 from collections.abc import Awaitable
-from typing import Any
+from typing import Any, NamedTuple
 
 import anyio
 import structlog
@@ -80,6 +80,12 @@ return id
 """
 
 
+class _ThreadKeys(NamedTuple):
+    events: str
+    snapshot_ids: str
+    snapshots: str
+
+
 def _serialize_payload(payload: Any) -> str:
     """Serialize an event payload to a JSON string for Redis transport."""
     return json.dumps(payload, default=_serializer.serialize)
@@ -138,12 +144,11 @@ class RedisBrokerManager(BaseBrokerManager):
         self._running: bool = False
 
     def stream_key(self, thread_id: str) -> str:
-        return self._keys(thread_id)[0]
+        return self._keys(thread_id).events
 
-    def _keys(self, thread_id: str) -> list[str]:
-        """The stream, snapshot-ids and snapshots keys of a thread."""
+    def _keys(self, thread_id: str) -> _ThreadKeys:
         base = f"{self._channel_prefix}thread:{{{thread_id}}}"
-        return [f"{base}:events", f"{base}:snapshot-ids", f"{base}:snapshots"]
+        return _ThreadKeys(f"{base}:events", f"{base}:snapshot-ids", f"{base}:snapshots")
 
     async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> bool:
         return await self._write(thread_id, run_id, write_id, "", _serialize_payload(event))
@@ -160,7 +165,9 @@ class RedisBrokerManager(BaseBrokerManager):
         while True:
             try:
                 # EVALSHA, loading the script on a NOSCRIPT reply.
-                await redis_manager.get_client().register_script(_WRITE_SCRIPT)(keys=self._keys(thread_id), args=args)
+                await redis_manager.get_client().register_script(_WRITE_SCRIPT)(
+                    keys=list(self._keys(thread_id)), args=args
+                )
                 return True
             except RedisError as e:
                 attempt += 1
@@ -181,20 +188,20 @@ class RedisBrokerManager(BaseBrokerManager):
             return []
         # RESP2 answers [[key, entries]], RESP3 {key: [entries]}.
         entries = reply[key][0] if isinstance(reply, dict) else reply[0][1]
-        return [(entry_id, fields["r"], fields["w"], _entry_event(fields)) for entry_id, fields in entries]
+        return [ThreadEntry(entry_id, fields["r"], fields["w"], _entry_event(fields)) for entry_id, fields in entries]
 
     async def read_snapshot_ids(self, thread_id: str) -> dict[str, str]:
-        return await redis_manager.get_client().hgetall(self._keys(thread_id)[1])  # type: ignore[invalid-await]  # redis.asyncio stubs
+        return await redis_manager.get_client().hgetall(self._keys(thread_id).snapshot_ids)  # type: ignore[invalid-await]  # redis.asyncio stubs
 
     async def read_snapshots(self, thread_id: str, namespaces: list[str]) -> dict[str, Snapshot]:
-        _, ids_key, snapshots_key = self._keys(thread_id)
+        keys = self._keys(thread_id)
         # One transaction, so each id belongs to the record read with it.
         pipe = redis_manager.get_client().pipeline(transaction=True)
-        pipe.hmget(ids_key, namespaces)
-        pipe.hmget(snapshots_key, namespaces)
+        pipe.hmget(keys.snapshot_ids, namespaces)
+        pipe.hmget(keys.snapshots, namespaces)
         ids, records = await pipe.execute()
         return {
-            namespace: (entry_id, json.loads(record))
+            namespace: Snapshot(entry_id, json.loads(record))
             for namespace, entry_id, record in zip(namespaces, ids, records, strict=True)
             if entry_id is not None and record is not None
         }

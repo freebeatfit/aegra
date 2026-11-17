@@ -65,10 +65,8 @@ jobs:
           POSTGRES_PORT: "5432"
           POSTGRES_DB: aegra
           AEGRA_TEST_REDIS_URL: redis://localhost:6379/15
-        # test_streaming_errors.py fails on unmodified upstream v0.11.0 (FB_PATCHES.md).
         run: >-
           uv run --package aegra-api pytest libs/aegra-api/tests/unit libs/aegra-api/tests/integration
-          --ignore=libs/aegra-api/tests/integration/test_streaming_errors.py
           && uv run --package aegra-cli pytest libs/aegra-cli/tests
 
       - name: Check the tag matches the package versions

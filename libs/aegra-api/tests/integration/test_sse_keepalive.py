@@ -25,7 +25,7 @@ from aegra_api.core.sse import get_sse_headers, make_sse_response, sse_to_bytes
 from aegra_api.services.base_broker import ThreadEntry
 from aegra_api.services.broker import BrokerManager
 from aegra_api.services.event_streaming import session as session_module
-from aegra_api.services.event_streaming.session import ThreadEventSession
+from aegra_api.services.event_streaming.session import ThreadEventSession, VisibleRun
 from aegra_api.settings import settings
 from tests.fixtures.streams import drive_sse
 
@@ -39,8 +39,8 @@ def local_broker_manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[BrokerMana
     yield manager
 
 
-async def _visible(_run_id: str) -> str:
-    return "graph"
+async def _visible(_run_id: str) -> VisibleRun:
+    return VisibleRun(graph="graph")
 
 
 def _response(thread_id: str) -> EventSourceResponse:

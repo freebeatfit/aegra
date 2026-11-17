@@ -15,6 +15,7 @@ from aegra_api.services.event_streaming import session as session_module
 from aegra_api.services.event_streaming.session import (
     RunLookup,
     ThreadEventSession,
+    VisibleRun,
     validate_channels,
 )
 
@@ -53,8 +54,8 @@ def live_manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[BrokerManager]:
 def _lookup(graph: str | None = None, *, hidden: tuple[str, ...] = ()) -> RunLookup:
     """Run lookup: every run is visible with *graph* except the *hidden* ones."""
 
-    async def lookup(run_id: str) -> str | None:
-        return None if run_id in hidden else (graph or "")
+    async def lookup(run_id: str) -> VisibleRun | None:
+        return None if run_id in hidden else VisibleRun(graph=graph)
 
     return lookup
 
@@ -707,9 +708,9 @@ class TestRunVisibility:
             )
         looked_up: list[str] = []
 
-        async def lookup(run_id: str) -> str | None:
+        async def lookup(run_id: str) -> VisibleRun | None:
             looked_up.append(run_id)
-            return ""
+            return VisibleRun(graph=None)
 
         await _collect(_make_session("t1", channels={"values"}, lookup_run=lookup))
 
@@ -894,9 +895,9 @@ class TestStaysOpen:
     async def test_run_started_after_the_stream_opened_is_delivered(self, live_manager: BrokerManager) -> None:
         looked_up: list[str] = []
 
-        async def lookup(run_id: str) -> str | None:
+        async def lookup(run_id: str) -> VisibleRun | None:
             looked_up.append(run_id)
-            return ""
+            return VisibleRun(graph=None)
 
         session = _make_session("t1", channels={"values", "lifecycle"}, lookup_run=lookup)
         reader = asyncio.create_task(_read_until_runs_end(session, 1))

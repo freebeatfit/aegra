@@ -44,10 +44,18 @@ from aegra_api.services.event_streaming.normalizers import (
 )
 from aegra_api.services.event_streaming.protocol import build_event
 
-__all__ = ["RunLookup", "ThreadEventSession", "validate_channels"]
+__all__ = ["RunLookup", "ThreadEventSession", "VisibleRun", "validate_channels"]
 
-# Async callable: the run's graph name ("" when unknown), or None when the caller can't see the run.
-RunLookup = Callable[[str], Awaitable[str | None]]
+
+@dataclasses.dataclass(frozen=True)
+class VisibleRun:
+    """A run the caller can see; ``graph`` is None when its assistant is gone."""
+
+    graph: str | None
+
+
+# Async callable: the run, or None when the caller can't see it.
+RunLookup = Callable[[str], Awaitable[VisibleRun | None]]
 
 # seq of a log entry "<ms>-<n>" is ((ms << 8) + n) << 3: 8 slots for the wire events one
 # entry projects to, and below 2**53 (JS-safe) until 2109. max() keeps it rising on overflow.
@@ -62,7 +70,7 @@ _ChannelEvent = tuple[str, dict[str, Any], list[str]]
 class _RunView:
     """What the session tracks for one visible run until its terminal."""
 
-    graph: str
+    graph: str | None
     # Subgraph namespaces started but not yet completed, closed by the terminal.
     open_namespaces: dict[str, list[str]] = dataclasses.field(default_factory=dict)
     # One input.requested per interrupt: it can surface via updates and the next values.
@@ -90,12 +98,12 @@ class ThreadEventSession:
         self._namespaces = [tuple(prefix) for prefix in namespaces] if namespaces else None
         self._depth = depth
         self._seq = 0
-        # run_id -> its graph name, or None when the caller can't see it.
-        self._graphs: dict[str, str | None] = {}
+        # run_id -> the run, or None when the caller can't see it.
+        self._visible: dict[str, VisibleRun | None] = {}
         # run_id -> its view, or None once it ended or when the caller can't see it.
         self._runs: dict[str, _RunView | None] = {}
         self._run_id = ""
-        self._view = _RunView(graph="")
+        self._view = _RunView(graph=None)
         self._wants_state = bool({"values", "checkpoints"} & channels)
         # Snapshots read but not yet emitted at their marker, by namespace key.
         self._pending: dict[str, Snapshot] = {}
@@ -115,12 +123,14 @@ class ThreadEventSession:
                 for envelope in await self._trimmed_snapshots(entries):
                     yield envelope
             await self._read_snapshots(entries)
-            for entry_id, run_id, write_id, raw_event in entries:
-                cursor = entry_id
-                for envelope in await self._ingest(entry_id, run_id, write_id, raw_event):
+            for entry in entries:
+                cursor = entry.entry_id
+                for envelope in await self._ingest(entry):
                     yield envelope
             # A snapshot whose marker passed unmatched waits for a newer marker, not here.
-            self._pending = {ns: snap for ns, snap in self._pending.items() if entry_key(snap[0]) > entry_key(cursor)}
+            self._pending = {
+                ns: snap for ns, snap in self._pending.items() if entry_key(snap.marker_id) > entry_key(cursor)
+            }
 
     async def _replay_start(self) -> str:
         """The cursor to replay from: before the earliest marker of a requested namespace's snapshot."""
@@ -134,14 +144,16 @@ class ThreadEventSession:
 
     async def _trimmed_snapshots(self, entries: list[ThreadEntry]) -> list[dict[str, Any]]:
         """Snapshots whose marker the log no longer holds, oldest first, ahead of the first entry read."""
-        first = entry_key(entries[0][0]) if entries else None
+        first = entry_key(entries[0].entry_id) if entries else None
         envelopes: list[dict[str, Any]] = []
-        for namespace, (entry_id, record) in sorted(self._pending.items(), key=lambda item: entry_key(item[1][0])):
+        for namespace, (entry_id, record) in sorted(
+            self._pending.items(), key=lambda item: entry_key(item[1].marker_id)
+        ):
             if first is not None and entry_key(entry_id) >= first:
                 continue
             del self._pending[namespace]
             run_id = record.get("run_id")
-            if not isinstance(run_id, str) or await self._graph(run_id) is None:
+            if not isinstance(run_id, str) or await self._lookup(run_id) is None:
                 continue
             ms, n = entry_key(entry_id)
             # Past the running seed's slot, as at the marker.
@@ -154,29 +166,30 @@ class ThreadEventSession:
         if not self._wants_state:
             return
         latest: dict[str, str] = {}
-        for entry_id, _, _, raw_event in entries:
-            namespace = _marker_namespace(raw_event)
+        for entry in entries:
+            namespace = _marker_namespace(entry.event)
             if namespace is not None and self._wants_namespace(json.loads(namespace)):
-                latest[namespace] = entry_id
+                latest[namespace] = entry.entry_id
         stale = [
             namespace
             for namespace, entry_id in latest.items()
-            if namespace not in self._pending or entry_key(self._pending[namespace][0]) < entry_key(entry_id)
+            if namespace not in self._pending or entry_key(self._pending[namespace].marker_id) < entry_key(entry_id)
         ]
         if stale:
             self._pending.update(await broker_manager.read_snapshots(self._thread_id, stale))
 
-    async def _graph(self, run_id: str) -> str | None:
-        if run_id not in self._graphs:
-            self._graphs[run_id] = await self._lookup_run(run_id)
-        return self._graphs[run_id]
+    async def _lookup(self, run_id: str) -> VisibleRun | None:
+        if run_id not in self._visible:
+            self._visible[run_id] = await self._lookup_run(run_id)
+        return self._visible[run_id]
 
-    async def _ingest(self, entry_id: str, run_id: str, write_id: str, raw_event: Any) -> list[dict[str, Any]]:
+    async def _ingest(self, entry: ThreadEntry) -> list[dict[str, Any]]:
         """Project one log entry; the first entry of a run also opens its root lifecycle."""
+        entry_id, run_id, write_id, raw_event = entry
         first = run_id not in self._runs
         if first:
-            graph = await self._graph(run_id)
-            self._runs[run_id] = None if graph is None else _RunView(graph=graph)
+            run = await self._lookup(run_id)
+            self._runs[run_id] = None if run is None else _RunView(graph=run.graph)
         view = self._runs[run_id]
         marker = _marker_namespace(raw_event)
         # A retried write lands twice with the same write id; a retried marker can match only once.
@@ -195,9 +208,9 @@ class ThreadEventSession:
             self._seq += 1
         if marker is not None:
             snapshot = self._pending.get(marker)
-            if snapshot is not None and snapshot[0] == entry_id:
+            if snapshot is not None and snapshot.marker_id == entry_id:
                 del self._pending[marker]
-                envelopes += self._snapshot(entry_id, snapshot[1])
+                envelopes += self._snapshot(entry_id, snapshot.record)
             return envelopes
         envelopes += self._project(entry_id, raw_event)
         if _is_terminal(raw_event):

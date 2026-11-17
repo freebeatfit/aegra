@@ -28,7 +28,7 @@ from aegra_api.services.run_preparation import (
     INTERRUPT_ID_PATTERN,
     InterruptNotPendingError,
     _prepare_run,
-    pending_interrupt_ids,
+    non_pending_interrupt_message,
 )
 
 logger = structlog.getLogger(__name__)
@@ -255,9 +255,8 @@ async def _input_respond(
         return build_error(command_id, "invalid_argument", error_message or "invalid params"), None
 
     if isinstance(params.get("responses"), list) or params.get("interrupt_id") is not None:
-        unknown_id = await _non_pending_interrupt(session, thread_id, user, resume)
-        if unknown_id is not None:
-            message = f"Unknown or already-consumed interrupt: {unknown_id}"
+        message = await _non_pending_interrupt(session, thread_id, user, resume)
+        if message is not None:
             return build_error(command_id, "no_such_interrupt", message), None
 
     assistant_id = params.get("assistant_id")
@@ -337,15 +336,14 @@ def _build_resume(params: dict[str, Any]) -> tuple[Any, tuple[ErrorCode, str] | 
 async def _non_pending_interrupt(
     session: AsyncSession, thread_id: str, user: User, interrupt_ids: Iterable[str]
 ) -> str | None:
-    """The first id not pending on the thread's latest checkpoint, or None.
+    """Why an id is not pending on the thread's latest checkpoint, or None.
 
     Fails open while a run is in flight, as the official server does: that run may still raise or answer
     interrupts, and run preparation's resume check decides.
     """
     if await _thread_status(session, thread_id, user) in (None, "busy"):
         return None
-    pending = await pending_interrupt_ids(thread_id)
-    return next((interrupt_id for interrupt_id in interrupt_ids if interrupt_id not in pending), None)
+    return await non_pending_interrupt_message(thread_id, interrupt_ids)
 
 
 async def _thread_assistant_id(session: AsyncSession, thread_id: str, user: User) -> str | None:
