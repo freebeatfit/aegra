@@ -98,7 +98,7 @@ This keeps overhead low and maintains compatibility with the entire OpenTelemetr
 
 ## Run metadata
 
-Each `POST /threads/{thread_id}/runs` (and `/runs/stream`, `/runs/wait`) request accepts an optional top-level `metadata` field whose key/value pairs are propagated onto the run's root OTEL span. This is the recommended channel for filterable trace attributes that aren't part of the LangGraph payload — tenant id, feature flag, environment tag, sub-agent type, and similar.
+Each `POST /threads/{thread_id}/runs` (and `/runs/wait`, and a v2 `run.start` command) request accepts an optional top-level `metadata` field whose key/value pairs are propagated onto the run's root OTEL span. This is the recommended channel for filterable trace attributes that aren't part of the LangGraph payload — tenant id, feature flag, environment tag, sub-agent type, and similar.
 
 ```json
 {

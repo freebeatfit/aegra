@@ -125,19 +125,15 @@ from langgraph_sdk import get_client
 async def main():
     client = get_client(url="http://localhost:2026")
 
-    # Create a thread
-    thread = await client.threads.create()
-    print(f"Thread ID: {thread['thread_id']}")
-
-    # Run the agent with streaming
-    async for chunk in client.runs.stream(
-        thread_id=thread["thread_id"],
-        assistant_id="agent",  # graph ID works as assistant ID
-        input={"messages": [{"type": "human", "content": "What is Aegra?"}]},
-        stream_mode=["messages-tuple"],
-    ):
-        if hasattr(chunk, "data") and chunk.data:
-            print(chunk.data)
+    # Open a thread stream (graph ID works as assistant ID) and start a run on it
+    async with client.threads.stream(assistant_id="agent") as thread:
+        print(f"Thread ID: {thread.thread_id}")
+        await thread.run.start(input={"messages": [{"type": "human", "content": "What is Aegra?"}]})
+        async for event in thread.subscribe(["messages", "lifecycle"]):
+            print(event["method"], event["params"]["data"])
+            if event["method"] == "lifecycle" and not event["params"]["namespace"]:
+                if event["params"]["data"]["event"] in ("completed", "failed", "interrupted"):
+                    break
 
 
 asyncio.run(main())
@@ -156,14 +152,13 @@ async def continue_conversation():
     thread_id = "your-thread-id-from-step-5"
 
     # Follow-up — the agent remembers the previous exchange
-    async for chunk in client.runs.stream(
-        thread_id=thread_id,
-        assistant_id="agent",
-        input={"messages": [{"type": "human", "content": "Tell me more about its features"}]},
-        stream_mode=["messages-tuple"],
-    ):
-        if hasattr(chunk, "data") and chunk.data:
-            print(chunk.data)
+    async with client.threads.stream(thread_id, assistant_id="agent") as thread:
+        await thread.run.start(input={"messages": [{"type": "human", "content": "Tell me more about its features"}]})
+        async for event in thread.subscribe(["messages", "lifecycle"]):
+            print(event["method"], event["params"]["data"])
+            if event["method"] == "lifecycle" and not event["params"]["namespace"]:
+                if event["params"]["data"]["event"] in ("completed", "failed", "interrupted"):
+                    break
 
 
 asyncio.run(continue_conversation())

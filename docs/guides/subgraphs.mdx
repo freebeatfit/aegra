@@ -39,16 +39,13 @@ Register the parent graph in `aegra.json`:
 
 ## Streaming subgraph events
 
-By default, streaming only includes events from the top-level graph. To include subgraph events:
+A thread stream carries subgraph events too, each with its `params.namespace`. Narrow them per connection with `namespaces` (prefixes) and `depth`:
 
 ```python
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="orchestrator",
-    input={"messages": [{"type": "human", "content": "Research this topic"}]},
-    stream_subgraphs=True,
-):
-    print(chunk)
+async with client.threads.stream(assistant_id="orchestrator") as thread:
+    await thread.run.start(input={"messages": [{"type": "human", "content": "Research this topic"}]})
+    async for event in thread.subscribe(["messages", "lifecycle"], depth=2):
+        print(event["params"]["namespace"], event["method"], event["params"]["data"])
 ```
 
 ## Interrupts in subgraphs

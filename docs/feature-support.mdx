@@ -36,10 +36,11 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Feature | Status | Notes |
 |:--|:--|:--|
 | Background runs | Supported | Non-blocking execution with polling. |
-| Streaming (7 SSE modes) | Supported | values, updates, messages, messages-tuple, custom, events, and debug. |
-| SSE reconnection | Supported | Resume interrupted streams from where they left off. |
+| Streaming (Agent Protocol v2) | Supported | Thread-scoped SSE on `POST /threads/{thread_id}/stream/events` with channels `values`, `updates`, `messages`, `tools`, `lifecycle`, `input`, `checkpoints`, `tasks`, `custom`. |
+| v1 run streams | Removed (fork) | `runs/stream` and `GET .../runs/{run_id}/stream` answer `410 Gone`; see [FB_PATCHES.md](https://github.com/freebeatfit/aegra/blob/fb/0.11.0/FB_PATCHES.md). |
+| SSE reconnection | Supported | A reconnect replays each namespace's latest state, then the events after it, within `RESUMABLE_STREAM_TTL_SECONDS`. |
 | Sync wait | Supported | Block until run completes and return final output. |
-| Subgraph streaming | Supported | Stream events from nested subgraphs. |
+| Subgraph streaming | Supported | Subgraph events arrive with their namespace; filter with `namespaces` / `depth`. |
 | Stateless runs | Supported | Execute without persisting thread state. |
 | Multitask strategy `reject` | Supported | A run with `multitask_strategy: "reject"` (v2 `multitaskStrategy`) is refused while the thread has a pending or running run: `409` on REST, `unknown_error` on v2 `run.start`. `interrupt`, `rollback` and `enqueue` are accepted but not applied yet; the new run starts alongside the active one. |
 | Checkpoint durability | Supported | `durability` (`sync`, `async`, `exit`) per run or cron, deprecated `checkpoint_during` alias, server default via `checkpointer.durability` or `AEGRA_CHECKPOINT_DURABILITY`. |
@@ -69,7 +70,7 @@ The LangGraph SDK sends these run and cron fields on every call. Every run strea
 | Cancel with `action=rollback` | Coming soon | Both cancel routes accept `interrupt` and `cancel`; `rollback` (cancel, then delete the run and its checkpoints) returns `422` until it lands. |
 | Job timeout | Supported | Configurable max execution time (default 1 hour). |
 | Postgres fallback | Supported | Workers fall back to DB polling when Redis is unavailable. |
-| Multi-instance SSE | Supported | SSE streams work across instances via Redis broker. |
+| Multi-instance SSE | Supported | One Redis Stream per thread, read with `XREAD BLOCK`, so any instance serves any thread's stream. |
 
 ### Human-in-the-loop
 

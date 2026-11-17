@@ -122,7 +122,8 @@ OTEL_TARGETS=LANGFUSE,PHOENIX
 | `/threads` | POST | Create conversation thread |
 | `/threads/{thread_id}/state` | GET | Get thread state |
 | `/threads/{thread_id}/runs` | POST | Execute graph (background) |
-| `/threads/{thread_id}/runs/stream` | POST | Execute graph (streaming) |
+| `/threads/{thread_id}/commands` | POST | Agent Protocol v2 command (`run.start`, `input.respond`) |
+| `/threads/{thread_id}/stream/events` | POST | Agent Protocol v2 thread event stream (SSE); the v1 `runs/stream` routes answer `410 Gone` |
 | `/threads/{thread_id}/runs/{run_id}/cancel` | POST | Cancel a run |
 | `/runs/crons` | POST | Create a stateless cron job |
 | `/threads/{thread_id}/runs/crons` | POST | Create a thread-bound cron job |

@@ -62,14 +62,13 @@ async def main():
     client = get_client(url="http://localhost:2026")
 
     # Each graph in aegra.json gets a default assistant, and run/cron APIs accept the graph ID directly
-    thread = await client.threads.create()
-
-    async for chunk in client.runs.stream(
-        thread_id=thread["thread_id"],
-        assistant_id="agent",
-        input={"messages": [{"type": "human", "content": "Hello!"}]},
-    ):
-        print(chunk)
+    async with client.threads.stream(assistant_id="agent") as thread:
+        await thread.run.start(input={"messages": [{"type": "human", "content": "Hello!"}]})
+        async for event in thread.subscribe(["messages", "lifecycle"]):
+            print(event["method"], event["params"]["data"])
+            if event["method"] == "lifecycle" and not event["params"]["namespace"]:
+                if event["params"]["data"]["event"] in ("completed", "failed", "interrupted"):
+                    break
 
 
 asyncio.run(main())

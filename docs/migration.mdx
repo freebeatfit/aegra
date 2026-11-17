@@ -8,10 +8,10 @@ description: "Step-by-step guide to switching from LangSmith Deployments to a se
 Your existing investment carries over:
 
 - **Graph code** — Your LangGraph agents work without modification.
-- **SDK client calls** — `get_client()`, `client.threads`, `client.runs.stream()` — all the same.
+- **SDK client calls** — `get_client()`, `client.threads`, `client.threads.stream()` — all the same. In this fork `client.runs.stream()` answers `410 Gone`; streaming is Agent Protocol v2 only.
 - **Agent Protocol frontends** — Agent Chat UI, LangGraph Studio, CopilotKit — all compatible.
 - **Thread state model** — Threads, checkpoints, and state inspection work identically.
-- **Streaming** — Same SSE modes and event format.
+- **Streaming** — Same Agent Protocol v2 thread stream and event format as the LangGraph Agent Server.
 - **Human-in-the-loop** — Same interrupt/resume patterns.
 
 ## What changes

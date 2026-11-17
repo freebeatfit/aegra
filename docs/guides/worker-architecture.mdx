@@ -142,9 +142,7 @@ Key details:
 
 ### Streaming run with crash recovery
 
-The full picture — a streaming run shows how the client SSE connection, worker execution, and reaper recovery all interact:
-
-<a href="https://mermaid.live/view#pako:eNqdVE1r4zAQ_SuDTw5tScPSi9kUksbQQEhN7NDLglHsaaNNLLmSvGm29L_vyHK-ncv6ZEYz8-a9edKXl8kcvQA8jR8VigxHnL0rVvwSQF_JlOEZL5kw8LTmKMxlfBCNL4MzzLm-DL9KtUJ1GR8N21qw0ua6E4d-9_hIcAFEL3ECXVUJ3dVG4W5cOqOM0TCA8TQOZwlQBvjaMFPpfoki5-L9FvATs8pwKVKCY4XuHBfXgwcwi-bxsy1PeQ5Gwm-5ANKnwkMuJbuhAojjENwc4G8YNwQDb1LBQkmiC_iHsiyMK3YiHLCGk-glOiCA_6DB8AJlZZrR6kQL6EqDZrCzdpb3PBoNkhDiMIGGNqWKmna2ZtQ0Txfb_qYuuYU1Mo0pfpZcoU6Z6Qu5uflxr-H1OZyFcCqcQxsNT-aQm0xWwvR74NfNgGUfFXXLOy3DxeEkfEou9D_L3PV2aZgSAZ_E6cANLJH8sUBm0rWUpauzf1ZhtYXefdPrmiznfKEPDWNXR0TbVxTNh5MxGcJt0hrCrjxbMiFwfbajY1O4_BYp3rhga_63Zrd3qK6yDLXucmFQqao0mHfpR6rO9U0fbXU6n0xadmrD7aysS3IpEFa4BT9JJtBb7l06lQZBkq7NRQx2Ij_oHWEbPl2tvZGn5mnsB4Pp6FL-n1b-Y1_toDLF9JJYOZ-3ATb0z-_2mRz_N8sJEBeZwoLWCKlCo7ZpbXgKX_HxvrjtJfEV3qFw19w-EExIsySJ3YXseLfgFagKxnN6kr88OivqxzlnauV9f_8DKe3lLA==" target="_blank" rel="noopener">View fullscreen ↗</a>
+The full picture — a streaming run shows how the client's thread stream, worker execution, and reaper recovery all interact:
 
 ```mermaid
 sequenceDiagram
@@ -155,10 +153,11 @@ sequenceDiagram
     participant DB
     participant Reaper
 
-    Client->>API: POST /runs/stream
+    Client->>API: POST /threads/{id}/stream/events
+    API-->>Client: SSE stream (XREAD BLOCK on the thread's stream)
+    Client->>API: POST /threads/{id}/commands (run.start)
     API->>DB: INSERT run (status=pending, execution_params)
     API->>Redis: RPUSH run_id to job queue
-    API-->>Client: SSE stream (waiting for broker events)
 
     Worker->>Redis: BLPOP job queue (5s timeout)
     Redis-->>Worker: run_id
@@ -169,7 +168,7 @@ sequenceDiagram
     loop every 10s
         Worker->>DB: UPDATE lease_expires_at = now+30s
     end
-    Worker->>Redis: PUBLISH events to SSE channel
+    Worker->>Redis: XADD events to the thread's stream (values: snapshot hash + marker)
     Redis-->>Client: SSE events
     Worker->>DB: finalize_run (status=success/interrupted/error)
     Worker->>DB: UPDATE claimed_by=NULL, lease_expires_at=NULL

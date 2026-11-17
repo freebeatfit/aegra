@@ -99,20 +99,15 @@ from langgraph_sdk import get_client
 async def main():
     client = get_client(url="http://localhost:2026")
 
-    thread = await client.threads.create()
-
-    # This will pause when the agent tries to use a tool
-    async for chunk in client.runs.stream(
-        thread_id=thread["thread_id"],
-        assistant_id="agent_hitl",
-        input={"messages": [{"type": "human", "content": "Search for AI news"}]},
-    ):
-        print(chunk)
-
-    # Check thread status
-    thread_state = await client.threads.get_state(thread["thread_id"])
-    print(f"Status: {thread_state.get('status', 'unknown')}")
-    print(f"Interrupts: {thread_state['interrupts']}")
+    async with client.threads.stream(assistant_id="agent_hitl") as thread:
+        await thread.run.start(input={"messages": [{"type": "human", "content": "Search for AI news"}]})
+        async for event in thread.subscribe(["messages", "lifecycle"]):
+            print(event["method"], event["params"]["data"])
+            if event["method"] == "lifecycle" and not event["params"]["namespace"]:
+                if event["params"]["data"]["event"] in ("completed", "failed", "interrupted"):
+                    break
+        print(f"Thread ID: {thread.thread_id}")
+        print(f"Interrupts: {thread.interrupts}")
 
 
 asyncio.run(main())
@@ -120,58 +115,41 @@ asyncio.run(main())
 
 ### 2. Resume with approval
 
+A stream opened on a thread that waits on an interrupt receives it again (as `input.requested`), so `thread.interrupts` fills in and `run.respond` answers it:
+
 ```python
-async def approve():
+async def resume(thread_id: str, decision: list[dict]) -> None:
     client = get_client(url="http://localhost:2026")
 
-    thread_id = "your-thread-id"
-
-    # Resume with approval
-    async for chunk in client.runs.stream(
-        thread_id=thread_id,
-        assistant_id="agent_hitl",
-        command={"resume": [{"type": "accept", "args": None}]},
-    ):
-        print(chunk)
+    async with client.threads.stream(thread_id, assistant_id="agent_hitl") as thread:
+        while not thread.interrupted:
+            await asyncio.sleep(0.05)
+        await thread.run.respond(decision)
+        print(await thread.output)
 
 
-asyncio.run(approve())
+asyncio.run(resume("your-thread-id", [{"type": "accept", "args": None}]))
 ```
 
 ### 3. Resume with edits
 
 ```python
 # Edit the tool arguments before executing
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="agent_hitl",
-    command={"resume": [{"type": "edit", "args": {"query": "AI news 2026"}}]},
-):
-    print(chunk)
+await resume(thread_id, [{"type": "edit", "args": {"query": "AI news 2026"}}])
 ```
 
 ### 4. Respond directly
 
 ```python
 # Skip the tool entirely and provide a human response
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="agent_hitl",
-    command={"resume": [{"type": "response", "args": "I already know the answer..."}]},
-):
-    print(chunk)
+await resume(thread_id, [{"type": "response", "args": "I already know the answer..."}])
 ```
 
 ### 5. Ignore the tool call
 
 ```python
 # Skip the tool and end the turn
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="agent_hitl",
-    command={"resume": [{"type": "ignore", "args": None}]},
-):
-    print(chunk)
+await resume(thread_id, [{"type": "ignore", "args": None}])
 ```
 
 ## Interrupt before/after nodes
@@ -179,14 +157,13 @@ async for chunk in client.runs.stream(
 You can also set interrupt points without modifying the graph code, using the `interrupt_before` and `interrupt_after` parameters on the run:
 
 ```python
-# Pause before the "tools" node executes
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
+# Pause before the "tools" node executes (REST runs; v2 run.start has no breakpoint params)
+await client.runs.wait(
+    thread_id,
     assistant_id="agent",
     input={"messages": [{"type": "human", "content": "Search for AI"}]},
     interrupt_before=["tools"],
-):
-    print(chunk)
+)
 ```
 
 Use `"*"` to interrupt before/after every node:

@@ -73,14 +73,10 @@ from langgraph_sdk import get_client
 client = get_client(url="http://localhost:2026")
 
 assistant = await client.assistants.create(graph_id="agent")
-thread = await client.threads.create()
-
-async for chunk in client.runs.stream(
-    thread_id=thread["thread_id"],
-    assistant_id=assistant["assistant_id"],
-    input={"messages": [{"type": "human", "content": "Hello!"}]},
-):
-    print(chunk)
+async with client.threads.stream(assistant_id=assistant["assistant_id"]) as thread:
+    await thread.run.start(input={"messages": [{"type": "human", "content": "Hello!"}]})
+    async for event in thread.subscribe(["messages", "lifecycle"]):
+        print(event["method"], event["params"]["data"])
 ```
 
 ## 🔥 Why Aegra?
@@ -104,7 +100,7 @@ async for chunk in client.runs.stream(
 - **[Worker architecture](https://docs.aegra.dev/guides/worker-architecture)** - Redis job queue with 30 concurrent runs per instance, lease-based crash recovery, and horizontal scaling across multiple instances
 - **[Scheduled cron jobs](https://docs.aegra.dev/guides/cron)** - Trigger runs on a schedule with standard 5-field or seconds-level 6-field expressions, IANA timezone support, and multi-instance safe `SKIP LOCKED` claim
 - **[Human-in-the-loop](https://docs.aegra.dev/guides/human-in-the-loop)** - Approval gates and user intervention points
-- **[Streaming](https://docs.aegra.dev/guides/streaming)** - Real-time SSE streaming with cross-instance pub/sub and automatic reconnection with event replay. Supports both the legacy run-scoped stream and **Agent Protocol v2** thread-scoped streaming (content-block events, per-subgraph lifecycle, HITL resume) for the latest LangGraph SDKs and `useStream()`
+- **[Streaming](https://docs.aegra.dev/guides/streaming)** - **Agent Protocol v2** thread-scoped SSE streaming (content-block events, per-subgraph lifecycle, HITL resume) for the latest LangGraph SDKs and `useStream()`: one Redis Stream per thread, each namespace's latest state plus the later events on reconnect, and time-based retention. The v1 run streams answer `410 Gone` in this fork ([FB_PATCHES.md](FB_PATCHES.md))
 - **[Persistent state](https://docs.aegra.dev/guides/threads-and-state)** - PostgreSQL checkpoints via LangGraph
 - **[Configurable auth](https://docs.aegra.dev/guides/authentication)** - JWT, OAuth, Firebase, or none
 - **[Unified Observability](https://docs.aegra.dev/guides/observability)** - Fan-out tracing support via OpenTelemetry
@@ -153,7 +149,7 @@ aegra version           # Show version info
 - [FastAPI](https://fastapi.tiangolo.com/) - HTTP layer
 - [LangGraph](https://github.com/langchain-ai/langgraph) - State management & graph execution
 - [PostgreSQL](https://www.postgresql.org/) - Persistence & checkpoints
-- [Redis](https://redis.io/) - Job queue, SSE pub/sub, crash recovery
+- [Redis](https://redis.io/) - Job queue, per-thread event streams, cancel pub/sub, crash recovery
 - [OpenTelemetry](https://opentelemetry.io/) - Observability standard
 - [pgvector](https://github.com/pgvector/pgvector) - Vector embeddings
 

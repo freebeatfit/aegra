@@ -6,7 +6,7 @@ description: "Stream agent responses in real time with Server-Sent Events."
 Aegra streams agent execution to clients using Server-Sent Events (SSE). This gives you real-time token-by-token output, tool call updates, and state changes as they happen.
 
 <Warning>
-  Freebeat fork: streaming is [Agent Protocol v2](#agent-protocol-v2-event-streaming) only. The v1 run-stream endpoints (`POST /threads/{thread_id}/runs/stream`, `GET /threads/{thread_id}/runs/{run_id}/stream`, `POST /runs/stream`) answer `410 Gone`, and every run, including one created through the REST run endpoints, streams its events on `POST /threads/{thread_id}/stream/events`. The v1 sections below describe upstream Aegra.
+  Freebeat fork: streaming is [Agent Protocol v2](#agent-protocol-v2-event-streaming) only. The v1 run-stream endpoints (`POST /threads/{thread_id}/runs/stream`, `GET /threads/{thread_id}/runs/{run_id}/stream`, `POST /runs/stream`) answer `410 Gone`, and every run, including one created through the REST run endpoints, streams its events on `POST /threads/{thread_id}/stream/events`. See [FB_PATCHES.md](https://github.com/freebeatfit/aegra/blob/fb/0.11.0/FB_PATCHES.md) for every deviation from upstream Aegra.
 </Warning>
 
 ## Quick example
@@ -19,38 +19,19 @@ from langgraph_sdk import get_client
 async def main():
     client = get_client(url="http://localhost:2026")
 
-    thread = await client.threads.create()
-
-    async for chunk in client.runs.stream(
-        thread_id=thread["thread_id"],
-        assistant_id="agent",
-        input={"messages": [{"type": "human", "content": "Hello!"}]},
-        stream_mode=["messages-tuple"],
-    ):
-        if hasattr(chunk, "data") and chunk.data:
-            print(chunk.data)
+    async with client.threads.stream(assistant_id="agent") as thread:
+        await thread.run.start(input={"messages": [{"type": "human", "content": "Hello!"}]})
+        async for event in thread.subscribe(["messages", "lifecycle"]):
+            print(event["method"], event["params"]["data"])
+            if event["method"] == "lifecycle" and not event["params"]["namespace"]:
+                if event["params"]["data"]["event"] in ("completed", "failed", "interrupted"):
+                    break
 
 
 asyncio.run(main())
 ```
 
-## Stream modes
-
-Control what data you receive by setting `stream_mode` on the run. You can pass a single mode as a string or multiple modes as a list.
-
-| Mode | What it streams |
-|------|----------------|
-| `values` | Full state snapshot after each node execution |
-| `updates` | Only the state changes (delta) produced by each node |
-| `messages` | LLM tokens and tool calls as `(message, metadata)` tuples with accumulation into `messages/partial` and `messages/complete` events |
-| `messages-tuple` | Raw message tuples without accumulation (JavaScript graph compatibility) |
-| `custom` | User-defined data emitted from inside nodes via `get_stream_writer()` |
-| `events` | Low-level LangGraph `astream_events` for fine-grained tracing |
-| `debug` | Checkpoint and task result events (auto-enabled on all streams) |
-
-<Note>
-  `debug` and `updates` are used internally on every stream for checkpoint tracking and interrupt detection, but their events are **only sent to the client if you explicitly request them** in `stream_mode`. When `updates` is not requested, only interrupt events (human-in-the-loop) are forwarded — remapped as `values` events for compatibility.
-</Note>
+The stream belongs to the thread, not the run: open it, start a run, and read the events of every run on the thread. Pick what you receive with [channels](#channels) rather than v1 `stream_mode`.
 
 ### Custom streaming
 
@@ -68,35 +49,55 @@ def my_node(state):
     return {"result": "done"}
 ```
 
-Receive custom events by including `custom` in the stream modes:
+Receive them on the `custom` channel (or `custom:<name>` for a named writer):
 
 ```python
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="agent",
-    input={"messages": [{"type": "human", "content": "Analyze this"}]},
-    stream_mode=["custom", "values"],
-):
-    print(f"Event: {chunk.event}, Data: {chunk.data}")
+async for event in thread.subscribe(["custom", "values"]):
+    print(event["method"], event["params"]["data"])
 ```
 
-### Using multiple modes
+### Subgraph events
+
+Events of subgraphs arrive on the same stream with their `params.namespace`. Filter them per connection with `namespaces` (a prefix list) and `depth`:
 
 ```python
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="agent",
-    input={"messages": [{"type": "human", "content": "Search for AI news"}]},
-    stream_mode=["values", "messages-tuple"],
-):
-    print(f"Event: {chunk.event}, Data: {chunk.data}")
+async for event in thread.subscribe(["messages"], namespaces=[["research"]], depth=2):
+    print(event["params"]["namespace"], event["params"]["data"])
 ```
 
-When multiple modes are active, the `event` field tells you which mode each chunk comes from.
+## REST runs
 
-## Event types
+`client.runs.create`, `wait`, `join`, `get`, `cancel` and `cancel_many` still work. A run created through them executes on the same v2 event path, so an open thread stream receives its events. The v1 stream options `stream_mode`, `stream_subgraphs`, `stream_resumable` and `on_disconnect` are accepted only with their SDK defaults (see [Feature support](/feature-support)); any other value returns `422`.
 
-During streaming, you'll receive these event types:
+### Wait for completion
+
+If you don't need streaming but want to wait for the result:
+
+```python
+result = await client.runs.wait(
+    thread_id=thread_id,
+    assistant_id="agent",
+    input={"messages": [{"type": "human", "content": "Hello"}]},
+)
+print(result)
+```
+
+This calls `POST /threads/{thread_id}/runs/wait` and returns the thread's values once the run settles, as the LangGraph Agent Server does (a run stores no output of its own).
+
+If the run fails, the body is an error envelope instead of an output:
+
+```json
+{"__error__": {"error": "Error", "message": "KeyError: 'topic'"}}
+```
+
+`client.runs.wait()` raises on that envelope by default; pass `raise_error=False` to get it
+back as a dict. The same envelope is returned when the wait gives up before the run reaches a
+terminal state (`TimeoutError` or `IncompleteRun`), and by `client.runs.join()`, which returns it
+rather than raising. An interrupted run is not a failure — it returns the thread's values at the interrupt.
+
+## Keep-alive
+
+The server sends SSE keepalive comments (`: heartbeat`) every `KEEPALIVE_INTERVAL_SECS` (default 5s, truncated to whole seconds, minimum 1s), so idle proxies (Nginx 60s, AWS ALB, Cloudflare) won't drop long-running silent agents — for example, a graph node holding an upstream WebSocket without emitting events. The wire-format matches LangGraph Platform, so existing SSE clients (the LangGraph SDK, browser `EventSource`, `httpx-sse`) silently ignore these lines per the W3C spec.
 
 ## Serialized graph values
 
@@ -117,109 +118,6 @@ Nested values inside Pydantic or LangChain model dumps are normalized using the
 same rules. Mapping values are serialized recursively, and non-JSON-native keys
 such as `UUID` or `Path` are converted to JSON property names with the same
 scalar rules. Key collisions after conversion raise a serialization error.
-
-| Event | Description |
-|-------|-------------|
-| `metadata` | Run metadata (run_id, attempt number) — sent first |
-| `values` | Full state snapshot (when using `values` mode) |
-| `updates` | State delta from a single node (when using `updates` mode) |
-| `messages/partial` | Partial message chunk (streaming token) |
-| `messages/complete` | Complete message after all tokens received |
-| `messages/metadata` | Message metadata (run_id) |
-| `custom` | User-defined data from `get_stream_writer()` |
-| `events` | LangGraph internal events (when using `events` mode) |
-| `debug` | Debug checkpoint and task result events |
-| `error` | Error during execution |
-| `end` | Stream complete |
-
-## Streaming endpoints
-
-### Create and stream
-
-The most common pattern — create a run and stream its output in one call:
-
-```python
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="agent",
-    input={"messages": [{"type": "human", "content": "Hello"}]},
-):
-    print(chunk)
-```
-
-This calls `POST /threads/{thread_id}/runs/stream` under the hood.
-
-### Stream an existing run
-
-If you created a background run, you can stream it later:
-
-```
-GET /threads/{thread_id}/runs/{run_id}/stream
-```
-
-This supports reconnection via the `Last-Event-ID` header. If the connection drops, the client can reconnect and receive events from where it left off.
-
-### Wait for completion
-
-If you don't need streaming but want to wait for the result:
-
-```python
-result = await client.runs.wait(
-    thread_id=thread_id,
-    assistant_id="agent",
-    input={"messages": [{"type": "human", "content": "Hello"}]},
-)
-print(result)
-```
-
-This calls `POST /threads/{thread_id}/runs/wait` and returns the final output.
-
-If the run fails, the body is an error envelope instead of an output:
-
-```json
-{"__error__": {"error": "Error", "message": "KeyError: 'topic'"}}
-```
-
-`client.runs.wait()` raises on that envelope by default; pass `raise_error=False` to get it
-back as a dict. The same envelope is returned when the wait gives up before the run reaches a
-terminal state (`TimeoutError` or `IncompleteRun`), and by `client.runs.join()`, which returns it
-rather than raising. An interrupted run is not a failure — it returns its partial output with
-`__interrupt__`.
-
-## Subgraph streaming
-
-If your graph uses subgraphs, you can stream events from them too:
-
-```python
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="agent",
-    input={"messages": [{"type": "human", "content": "Hello"}]},
-    stream_subgraphs=True,
-):
-    print(chunk)
-```
-
-## Disconnection behavior
-
-By default, when a client disconnects during streaming, the run is cancelled. You can change this:
-
-```python
-async for chunk in client.runs.stream(
-    thread_id=thread_id,
-    assistant_id="agent",
-    input={"messages": [{"type": "human", "content": "Hello"}]},
-    on_disconnect="continue",  # keep running even if client disconnects
-):
-    print(chunk)
-```
-
-| Value | Behavior |
-|-------|----------|
-| `"cancel"` (default) | Cancel the run when client disconnects |
-| `"continue"` | Run continues in the background; reconnect later to get results |
-
-The server sends SSE keepalive comments (`: heartbeat`) every `KEEPALIVE_INTERVAL_SECS` (default 5s, truncated to whole seconds, minimum 1s), so idle proxies (Nginx 60s, AWS ALB, Cloudflare) won't drop long-running silent agents — for example, a graph node holding an upstream WebSocket without emitting events. The wire-format matches LangGraph Platform, so existing SSE clients (the LangGraph SDK, browser `EventSource`, `httpx-sse`) silently ignore these lines per the W3C spec. Only a real client disconnect — not an idle proxy timeout — triggers automatic cancellation.
 
 ## Background runs
 
