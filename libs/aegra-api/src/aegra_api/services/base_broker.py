@@ -5,6 +5,11 @@ order (a Redis Stream when ``REDIS_BROKER_ENABLED=true``, a list in dev mode).
 A thread stream reads the log from its cursor, the entry id, with a bounded
 blocking read, so a run started after the stream opened shows up on it.
 
+Each entry stores its ``seq`` base, assigned at write time from a per-thread
+counter as ``max(counter + SEQ_STRIDE, now_ms * SEQ_STRIDE)``: it rises across
+runs, never goes back after the log expires, and reads the same on every
+connection.
+
 Full state is kept once per namespace, not in the log: every ``values`` event,
 interrupts included, replaces the namespace's snapshot (with its checkpoint
 envelope) and appends a small marker entry in the same atomic write. Each write
@@ -31,12 +36,15 @@ READ_BATCH = 200
 
 SNAPSHOT_MARKER = "snapshot"
 ROOT_NAMESPACE = "[]"
+# Wire events one entry can project to. now_ms * 2048 stays above fb.6's seqs and below 2**53 (JS-safe) until 2109.
+SEQ_STRIDE = 2048
 
 
 class ThreadEntry(NamedTuple):
     """One log entry. ``entry_id`` is ``<ms>-<n>`` and rises with every write; a retried write keeps its ``write_id``."""
 
     entry_id: str
+    seq: int
     run_id: str
     write_id: str
     # A marker's event is (SNAPSHOT_MARKER, namespace key): its snapshot lives in the thread's snapshots.
@@ -47,6 +55,7 @@ class Snapshot(NamedTuple):
     """A namespace's latest full state and the id of the marker entry written with it."""
 
     marker_id: str
+    seq: int
     # {"run_id", "checkpoint": envelope event or None, "values": event}
     record: dict[str, Any]
 
@@ -57,6 +66,10 @@ def namespace_key(namespace: list[str]) -> str:
 
 def is_end_event(event: Any) -> bool:
     return isinstance(event, (tuple, list)) and len(event) >= 1 and event[0] == "end"
+
+
+def next_seq(last: int, now_ms: int) -> int:
+    return max(last + SEQ_STRIDE, now_ms * SEQ_STRIDE)
 
 
 def entry_key(entry_id: str) -> tuple[int, int]:

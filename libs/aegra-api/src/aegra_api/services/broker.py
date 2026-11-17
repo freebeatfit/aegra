@@ -18,6 +18,7 @@ from aegra_api.services.base_broker import (
     Snapshot,
     ThreadEntry,
     entry_key,
+    next_seq,
 )
 from aegra_api.settings import settings
 
@@ -34,6 +35,7 @@ class _ThreadLog:
         self.entries: deque[ThreadEntry] = deque()
         self.snapshots: dict[str, Snapshot] = {}
         self.last_key = (0, 0)
+        self.last_seq = 0
         self.last_write = time.monotonic()
         # Replaced on every write, so a reader waits on the one current when it looked.
         self.written = asyncio.Event()
@@ -47,8 +49,8 @@ class _ThreadLog:
         fresh.reverse()
         return fresh[:READ_BATCH]
 
-    def write(self, run_id: str, write_id: str, event: Any) -> str:
-        """Trim like the Redis backend's ``XADD MINID``, append, and wake readers. Returns the entry id."""
+    def write(self, run_id: str, write_id: str, event: Any) -> ThreadEntry:
+        """Trim like the Redis backend's ``XADD MINID``, append, and wake readers."""
         ms = time.time_ns() // 1_000_000
         oldest = ms - settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS * 1000
         if root := self.snapshots.get(ROOT_NAMESPACE):
@@ -64,12 +66,13 @@ class _ThreadLog:
             }
         last_ms, last_n = self.last_key
         self.last_key = (ms, 0) if ms > last_ms else (last_ms, last_n + 1)
-        entry_id = f"{self.last_key[0]}-{self.last_key[1]}"
-        self.entries.append(ThreadEntry(entry_id, run_id, write_id, event))
+        self.last_seq = next_seq(self.last_seq, ms)
+        entry = ThreadEntry(f"{self.last_key[0]}-{self.last_key[1]}", self.last_seq, run_id, write_id, event)
+        self.entries.append(entry)
         self.last_write = time.monotonic()
         written, self.written = self.written, asyncio.Event()
         written.set()
-        return entry_id
+        return entry
 
 
 class BrokerManager(BaseBrokerManager):
@@ -94,7 +97,8 @@ class BrokerManager(BaseBrokerManager):
         self, thread_id: str, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
     ) -> bool:
         log = self._log(thread_id)
-        log.snapshots[namespace] = Snapshot(log.write(run_id, write_id, (SNAPSHOT_MARKER, namespace)), record)
+        marker = log.write(run_id, write_id, (SNAPSHOT_MARKER, namespace))
+        log.snapshots[namespace] = Snapshot(marker.entry_id, marker.seq, record)
         return True
 
     async def read_thread(self, thread_id: str, after: str) -> list[ThreadEntry]:

@@ -2,7 +2,8 @@
 
 Each thread's events live in one Redis Stream, ``<prefix>thread:{<thread_id>}:events``,
 and its latest full state per namespace in two hashes, ``...:snapshots`` (namespace ->
-record) and ``...:snapshot-ids`` (namespace -> marker entry id). The braces are a
+record) and ``...:snapshot-ids`` (namespace -> "<marker entry id> <seq>"); ``...:seq``
+holds the thread's last seq and outlives the others by a day. The braces are a
 Cluster hash tag, so a thread's keys share a slot. Every run on the thread appends
 to the stream; a thread stream reads it with ``XREAD BLOCK`` from its cursor on a
 connection from a dedicated pool. Cancel commands still go over pub/sub: they are
@@ -27,10 +28,12 @@ from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import (
     READ_BATCH,
     ROOT_NAMESPACE,
+    SEQ_STRIDE,
     SNAPSHOT_MARKER,
     BaseBrokerManager,
     Snapshot,
     ThreadEntry,
+    entry_key,
 )
 from aegra_api.settings import settings
 
@@ -47,29 +50,35 @@ _BACKOFF_FACTOR = 2.0
 # blip is retried rather than dropping the event. Readers drop a retried copy by write id.
 _PUT_MAX_ATTEMPTS = 3
 
+# The seq counter outlives the stream window by far, so seq never goes back after the stream expires.
+_SEQ_TTL_SECONDS = 24 * 3600
+
 # One atomic write per event; the keys share the thread's hash tag (one Cluster slot). A script, not MULTI,
 # so a snapshot records its marker's id, the time trim stops at the root snapshot's marker, and a
 # subgraph snapshot whose marker was trimmed goes with it.
-# ARGV: window ms, TTL s, run id, write id, namespace ("" for a plain event), payload.
+# ARGV: window ms, TTL s, run id, write id, namespace ("" for a plain event), payload, seq TTL s.
 _WRITE_SCRIPT = f"""
 local now = redis.call('TIME')
-local oldest = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) - tonumber(ARGV[1])
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+local oldest = now_ms - tonumber(ARGV[1])
 local root = redis.call('HGET', KEYS[2], '{ROOT_NAMESPACE}')
 if root then oldest = math.min(oldest, tonumber(string.match(root, '^%d+'))) end
 local minid = string.format('%.0f', oldest)
+local seq = string.format('%.0f', math.max(tonumber(redis.call('GET', KEYS[4]) or 0) + {SEQ_STRIDE}, now_ms * {SEQ_STRIDE}))
+redis.call('SET', KEYS[4], seq, 'EX', ARGV[7])
 local id
 if ARGV[5] == '' then
-  id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 'r', ARGV[3], 'w', ARGV[4], 'e', ARGV[6])
+  id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 's', seq, 'r', ARGV[3], 'w', ARGV[4], 'e', ARGV[6])
 else
-  id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 'r', ARGV[3], 'w', ARGV[4], 'm', ARGV[5])
-  redis.call('HSET', KEYS[2], ARGV[5], id)
+  id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 's', seq, 'r', ARGV[3], 'w', ARGV[4], 'm', ARGV[5])
+  redis.call('HSET', KEYS[2], ARGV[5], id .. ' ' .. seq)
   redis.call('HSET', KEYS[3], ARGV[5], ARGV[6])
 end
 local first = redis.call('XRANGE', KEYS[1], '-', '+', 'COUNT', 1)[1][1]
 local fms, fn = string.match(first, '^(%d+)-(%d+)$')
 local ids = redis.call('HGETALL', KEYS[2])
 for i = 1, #ids, 2 do
-  local ms, n = string.match(ids[i + 1], '^(%d+)-(%d+)$')
+  local ms, n = string.match(ids[i + 1], '^(%d+)-(%d+) ')
   if ids[i] ~= '{ROOT_NAMESPACE}' and (tonumber(ms) < tonumber(fms) or (ms == fms and tonumber(n) < tonumber(fn))) then
     redis.call('HDEL', KEYS[2], ids[i])
     redis.call('HDEL', KEYS[3], ids[i])
@@ -84,6 +93,7 @@ class _ThreadKeys(NamedTuple):
     events: str
     snapshot_ids: str
     snapshots: str
+    seq: str
 
 
 def _serialize_payload(payload: Any) -> str:
@@ -108,6 +118,15 @@ def _entry_event(fields: dict[str, str]) -> Any:
     if "m" in fields:
         return (SNAPSHOT_MARKER, fields["m"])
     return _deserialize_payload(json.loads(fields["e"]))
+
+
+def _stored_seq(entry_id: str, seq: str | None) -> int:
+    """The entry's stored seq; an entry fb.6 wrote has none, so number it as fb.6 did."""
+    # ponytail: rolling-upgrade shim, delete once no fb.6 keys can be left (one stream window after fb.7 is live).
+    if seq is not None:
+        return int(seq)
+    ms, n = entry_key(entry_id)
+    return ((ms << 8) + n) << 3
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -148,7 +167,7 @@ class RedisBrokerManager(BaseBrokerManager):
 
     def _keys(self, thread_id: str) -> _ThreadKeys:
         base = f"{self._channel_prefix}thread:{{{thread_id}}}"
-        return _ThreadKeys(f"{base}:events", f"{base}:snapshot-ids", f"{base}:snapshots")
+        return _ThreadKeys(f"{base}:events", f"{base}:snapshot-ids", f"{base}:snapshots", f"{base}:seq")
 
     async def append(self, thread_id: str, run_id: str, write_id: str, event: Any) -> bool:
         return await self._write(thread_id, run_id, write_id, "", _serialize_payload(event))
@@ -160,7 +179,7 @@ class RedisBrokerManager(BaseBrokerManager):
 
     async def _write(self, thread_id: str, run_id: str, write_id: str, namespace: str, payload: str) -> bool:
         window = settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
-        args = [window * 1000, window, run_id, write_id, namespace, payload]
+        args = [window * 1000, window, run_id, write_id, namespace, payload, _SEQ_TTL_SECONDS]
         attempt = 0
         while True:
             try:
@@ -188,10 +207,16 @@ class RedisBrokerManager(BaseBrokerManager):
             return []
         # RESP2 answers [[key, entries]], RESP3 {key: [entries]}.
         entries = reply[key][0] if isinstance(reply, dict) else reply[0][1]
-        return [ThreadEntry(entry_id, fields["r"], fields["w"], _entry_event(fields)) for entry_id, fields in entries]
+        return [
+            ThreadEntry(
+                entry_id, _stored_seq(entry_id, fields.get("s")), fields["r"], fields["w"], _entry_event(fields)
+            )
+            for entry_id, fields in entries
+        ]
 
     async def read_snapshot_ids(self, thread_id: str) -> dict[str, str]:
-        return await redis_manager.get_client().hgetall(self._keys(thread_id).snapshot_ids)  # type: ignore[invalid-await]  # redis.asyncio stubs
+        ids = await redis_manager.get_client().hgetall(self._keys(thread_id).snapshot_ids)  # type: ignore[invalid-await]  # redis.asyncio stubs
+        return {namespace: marker.partition(" ")[0] for namespace, marker in ids.items()}
 
     async def read_snapshots(self, thread_id: str, namespaces: list[str]) -> dict[str, Snapshot]:
         keys = self._keys(thread_id)
@@ -199,12 +224,14 @@ class RedisBrokerManager(BaseBrokerManager):
         pipe = redis_manager.get_client().pipeline(transaction=True)
         pipe.hmget(keys.snapshot_ids, namespaces)
         pipe.hmget(keys.snapshots, namespaces)
-        ids, records = await pipe.execute()
-        return {
-            namespace: Snapshot(entry_id, json.loads(record))
-            for namespace, entry_id, record in zip(namespaces, ids, records, strict=True)
-            if entry_id is not None and record is not None
-        }
+        markers, records = await pipe.execute()
+        snapshots: dict[str, Snapshot] = {}
+        for namespace, marker, record in zip(namespaces, markers, records, strict=True):
+            if marker is None or record is None:
+                continue
+            entry_id, _, seq = marker.partition(" ")
+            snapshots[namespace] = Snapshot(entry_id, _stored_seq(entry_id, seq or None), json.loads(record))
+        return snapshots
 
     async def start(self) -> None:
         """Start the cancel command listener."""

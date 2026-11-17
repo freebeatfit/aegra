@@ -16,8 +16,8 @@ seq/event_id, filters by channel, splits interrupts onto the ``input``
 channel, normalizes state message payloads, and derives each run's root
 lifecycle.
 
-``seq`` numbers up from the log entry id, so it rises across runs and is the
-same on every connection. ``event_id`` is ``<entry id>:<index>`` (a snapshot's
+``seq`` numbers up from the seq stored with each log entry, so it rises across
+runs and is the same on every connection. ``event_id`` is ``<entry id>:<index>`` (a snapshot's
 is its marker's; root lifecycle: ``synth:<run_id>:...``), stable across replays
 for client dedup. ``since`` filters what was already seen.
 
@@ -56,11 +56,6 @@ class VisibleRun:
 
 # Async callable: the run, or None when the caller can't see it.
 RunLookup = Callable[[str], Awaitable[VisibleRun | None]]
-
-# seq of a log entry "<ms>-<n>" is ((ms << 8) + n) << 3: 8 slots for the wire events one
-# entry projects to, and below 2**53 (JS-safe) until 2109. max() keeps it rising on overflow.
-_SEQ_SLOT_BITS = 3
-_SEQ_N_BITS = 8
 
 # A projected channel event: (wire method, params.data, namespace).
 _ChannelEvent = tuple[str, dict[str, Any], list[str]]
@@ -146,7 +141,7 @@ class ThreadEventSession:
         """Snapshots whose marker the log no longer holds, oldest first, ahead of the first entry read."""
         first = entry_key(entries[0].entry_id) if entries else None
         envelopes: list[dict[str, Any]] = []
-        for namespace, (entry_id, record) in sorted(
+        for namespace, (entry_id, seq, record) in sorted(
             self._pending.items(), key=lambda item: entry_key(item[1].marker_id)
         ):
             if first is not None and entry_key(entry_id) >= first:
@@ -155,9 +150,8 @@ class ThreadEventSession:
             run_id = record.get("run_id")
             if not isinstance(run_id, str) or await self._lookup(run_id) is None:
                 continue
-            ms, n = entry_key(entry_id)
             # Past the running seed's slot, as at the marker.
-            self._seq = max(self._seq, ((ms << _SEQ_N_BITS) + n) << _SEQ_SLOT_BITS) + 1
+            self._seq = max(self._seq, seq) + 1
             envelopes += self._snapshot(entry_id, record)
         return envelopes
 
@@ -185,7 +179,7 @@ class ThreadEventSession:
 
     async def _ingest(self, entry: ThreadEntry) -> list[dict[str, Any]]:
         """Project one log entry; the first entry of a run also opens its root lifecycle."""
-        entry_id, run_id, write_id, raw_event = entry
+        entry_id, seq, run_id, write_id, raw_event = entry
         first = run_id not in self._runs
         if first:
             run = await self._lookup(run_id)
@@ -197,8 +191,8 @@ class ThreadEventSession:
             return []
         view.last_write = write_id
         self._run_id, self._view = run_id, view
-        ms, n = entry_key(entry_id)
-        self._seq = max(self._seq, ((ms << _SEQ_N_BITS) + n) << _SEQ_SLOT_BITS)
+        # max() keeps seq rising should an entry ever project to more than SEQ_STRIDE events.
+        self._seq = max(self._seq, seq)
 
         envelopes: list[dict[str, Any]] = []
         if first:

@@ -600,8 +600,12 @@ async def test_retention_trims_by_time_and_expires_the_keys_after_the_last_write
         left = list(stream_server.redis.scan_iter(f"{stream_server.prefix}thread:{{{thread_id}}}:*"))
 
     assert kept != oldest  # the first run's events outlived the window and were trimmed
-    assert len(keys) == 3 and all(0 < ttl <= 1000 for ttl in ttls)
-    assert left == []
+    ttl_by_suffix = {key.rsplit(":", 1)[1]: ttl for key, ttl in zip(keys, ttls, strict=True)}
+    assert sorted(ttl_by_suffix) == ["events", "seq", "snapshot-ids", "snapshots"]
+    assert all(0 < ttl <= 1000 for suffix, ttl in ttl_by_suffix.items() if suffix != "seq")
+    # The seq counter outlives the window by far, so seq never goes back on the thread.
+    assert ttl_by_suffix["seq"] > 3_600_000
+    assert [key.rsplit(":", 1)[1] for key in left] == ["seq"]
 
 
 @pytest.mark.asyncio

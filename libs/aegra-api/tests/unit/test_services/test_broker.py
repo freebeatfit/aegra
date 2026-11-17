@@ -27,9 +27,9 @@ class TestRunBroker:
 
         await broker.put(("updates", {"a": 1}))
 
-        [(entry_id, run_id, _write_id, event)] = await manager.read_thread("t1", "0-0")
-        assert (run_id, event) == ("run-1", ("updates", {"a": 1}))
-        assert entry_key(entry_id) > (0, 0)
+        [entry] = await manager.read_thread("t1", "0-0")
+        assert (entry.run_id, entry.event) == ("run-1", ("updates", {"a": 1}))
+        assert entry_key(entry.entry_id) > (0, 0)
 
     @pytest.mark.asyncio
     async def test_values_replace_the_namespace_snapshot_with_its_envelope_and_append_a_marker(self) -> None:
@@ -42,13 +42,14 @@ class TestRunBroker:
         await broker.put(_event("values", {"a": 2}))
 
         entries = await manager.read_thread("t1", "0-0")
-        assert [event for *_rest, event in entries] == [(SNAPSHOT_MARKER, "[]"), (SNAPSHOT_MARKER, "[]")]
-        assert await manager.read_snapshot_ids("t1") == {"[]": entries[1][0]}
+        assert [entry.event for entry in entries] == [(SNAPSHOT_MARKER, "[]"), (SNAPSHOT_MARKER, "[]")]
+        assert await manager.read_snapshot_ids("t1") == {"[]": entries[1].entry_id}
         snapshots = await manager.read_snapshots("t1", ["[]", '["sub"]'])
         # The second values came without an envelope, so it keeps the namespace's last one.
         assert snapshots == {
             "[]": (
-                entries[1][0],
+                entries[1].entry_id,
+                entries[1].seq,
                 {"run_id": "run-1", "checkpoint": checkpoint[1], "values": _event("values", {"a": 2})[1]},
             )
         }
@@ -62,8 +63,8 @@ class TestRunBroker:
         await broker.put(checkpoint)
         await broker.put(values)
 
-        [(entry_id, record)] = (await manager.read_snapshots("t1", ['["sub"]'])).values()
-        assert record == {"run_id": "run-1", "checkpoint": checkpoint[1], "values": values[1]}
+        [snapshot] = (await manager.read_snapshots("t1", ['["sub"]'])).values()
+        assert snapshot.record == {"run_id": "run-1", "checkpoint": checkpoint[1], "values": values[1]}
 
     @pytest.mark.asyncio
     async def test_values_with_interrupts_replace_the_snapshot_with_the_namespaces_last_envelope(self) -> None:
@@ -77,14 +78,18 @@ class TestRunBroker:
             await broker.put(event)
 
         entries = await manager.read_thread("t1", "0-0")
-        assert [event for *_rest, event in entries] == [
+        assert [entry.event for entry in entries] == [
             (SNAPSHOT_MARKER, "[]"),
             (SNAPSHOT_MARKER, "[]"),
             ("end", {"status": "interrupted"}),
         ]
         snapshots = await manager.read_snapshots("t1", ["[]"])
         assert snapshots == {
-            "[]": (entries[1][0], {"run_id": "run-1", "checkpoint": checkpoint[1], "values": interrupted[1]})
+            "[]": (
+                entries[1].entry_id,
+                entries[1].seq,
+                {"run_id": "run-1", "checkpoint": checkpoint[1], "values": interrupted[1]},
+            )
         }
 
     @pytest.mark.asyncio
@@ -98,9 +103,9 @@ class TestRunBroker:
             await broker.put(event)
 
         entries = await manager.read_thread("t1", "0-0")
-        assert [event for *_rest, event in entries] == [first, second, (SNAPSHOT_MARKER, "[]")]
-        [(_, record)] = (await manager.read_snapshots("t1", ["[]"])).values()
-        assert record["checkpoint"] is None
+        assert [entry.event for entry in entries] == [first, second, (SNAPSHOT_MARKER, "[]")]
+        [snapshot] = (await manager.read_snapshots("t1", ["[]"])).values()
+        assert snapshot.record["checkpoint"] is None
 
     @pytest.mark.asyncio
     async def test_end_event_marks_finished_and_later_events_are_dropped(self) -> None:
@@ -111,7 +116,7 @@ class TestRunBroker:
         await broker.put(("values", {"late": True}))
 
         assert broker.is_finished()
-        assert [event for *_rest, event in await manager.read_thread("t1", "0-0")] == [("end", {"status": "success"})]
+        assert [entry.event for entry in await manager.read_thread("t1", "0-0")] == [("end", {"status": "success"})]
 
 
 class _FailingManager(BrokerManager):
@@ -172,9 +177,11 @@ class TestThreadLog:
 
         entries = await manager.read_thread("t1", "0-0")
 
-        keys = [entry_key(entry_id) for entry_id, *_ in entries]
+        keys = [entry_key(entry.entry_id) for entry in entries]
         assert keys == sorted(set(keys))
-        assert [run_id for _, run_id, _, _ in entries] == ["run-0", "run-1", "run-0", "run-1", "run-0"]
+        seqs = [entry.seq for entry in entries]
+        assert seqs == sorted(set(seqs))
+        assert [entry.run_id for entry in entries] == ["run-0", "run-1", "run-0", "run-1", "run-0"]
 
     @pytest.mark.asyncio
     async def test_read_returns_only_entries_after_the_cursor(self) -> None:
@@ -183,9 +190,9 @@ class TestThreadLog:
             await manager.append("t1", "run-1", f"w{i}", ("updates", {"i": i}))
         first, *_ = await manager.read_thread("t1", "0-0")
 
-        rest = await manager.read_thread("t1", first[0])
+        rest = await manager.read_thread("t1", first.entry_id)
 
-        assert [event for *_rest, event in rest] == [("updates", {"i": 1}), ("updates", {"i": 2})]
+        assert [entry.event for entry in rest] == [("updates", {"i": 1}), ("updates", {"i": 2})]
 
     @pytest.mark.asyncio
     async def test_threads_are_separate(self) -> None:
@@ -205,7 +212,7 @@ class TestThreadLog:
         await manager.append("t1", "run-1", "w1", ("values", {"a": 1}))
 
         entries = await asyncio.wait_for(reader, timeout=1.0)
-        assert [event for *_rest, event in entries] == [("values", {"a": 1})]
+        assert [entry.event for entry in entries] == [("values", {"a": 1})]
 
     @pytest.mark.asyncio
     async def test_idle_read_returns_empty_after_its_wait(self) -> None:
@@ -261,7 +268,7 @@ class TestBrokerManager:
         task.cancel.assert_called_once()
         broker = manager.get_broker("run-1")
         assert broker is not None and broker.is_finished()
-        assert (await manager.read_thread("t1", "0-0"))[-1][3] == ("end", {"status": "interrupted"})
+        assert (await manager.read_thread("t1", "0-0"))[-1].event == ("end", {"status": "interrupted"})
 
     @pytest.mark.asyncio
     async def test_request_cancel_can_leave_terminal_signaling_to_the_api(self) -> None:
@@ -312,7 +319,7 @@ class TestReplayRetention:
         clock[0] += (RETENTION + 1) * 1_000_000_000
         await manager.append("t1", "run-1", "w2", ("updates", {"i": 2}))
 
-        events = [event for *_rest, event in await manager.read_thread("t1", "0-0")]
+        events = [entry.event for entry in await manager.read_thread("t1", "0-0")]
         assert events == [(SNAPSHOT_MARKER, "[]"), ("updates", {"i": 1}), ("updates", {"i": 2})]
 
     @pytest.mark.asyncio

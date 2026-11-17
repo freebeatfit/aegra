@@ -222,16 +222,15 @@ class TestForwarding:
 
 
 class TestSeqAndFilter:
-    async def test_seq_numbers_up_from_the_log_entry_id(self, manager: BrokerManager) -> None:
+    async def test_seq_numbers_up_from_the_seq_stored_with_the_entry(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
-        entry_id = manager._log("t1").entries[0][0]
-        ms, n = entry_key(entry_id)
+        entry = manager._log("t1").entries[0]
 
         events = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
 
         # The run's running seed takes the first slot of its first entry, the values the next.
-        assert [e["seq"] for e in events[:2]] == [((ms << 8) + n << 3) + 1, ((ms << 8) + n << 3) + 2]
-        assert events[1]["event_id"] == f"{entry_id}:0"
+        assert [e["seq"] for e in events[:2]] == [entry.seq + 1, entry.seq + 2]
+        assert events[1]["event_id"] == f"{entry.entry_id}:0"
 
     async def test_seq_rises_across_runs(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
@@ -308,6 +307,34 @@ class TestSeqAndFilter:
         seq_by_id = {e["event_id"]: e["seq"] for e in full}
         assert [e["event_id"] for e in trimmed[1:]] == [e["event_id"] for e in full[4:]]
         assert [e["seq"] for e in trimmed[1:]] == [seq_by_id[e["event_id"]] for e in trimmed[1:]]
+
+    async def test_seq_does_not_depend_on_where_replay_started(
+        self, manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An entry that projects to many events, or many entries in one millisecond, keep their seqs."""
+        monkeypatch.setattr(broker_module.time, "time_ns", lambda: 1_794_000_000_000_000_000)
+        interrupts = [{"id": f"i{i}", "value": i} for i in range(12)]
+        many = ("values", _protocol_event("values", {"a": 0}, interrupts=interrupts))
+        updates = [("updates", _protocol_event("updates", {"node": {"i": i}})) for i in range(300)]
+        await _seed(manager, "run-1", [many, *updates, ("end", {"status": "success"})])
+        full = await _collect(_make_session("t1", channels={"values", "updates", "input", "lifecycle"}))
+        manager._log("t1").entries.popleft()
+
+        trimmed = await _collect(_make_session("t1", channels={"values", "updates", "input", "lifecycle"}))
+
+        seq_by_id = {e["event_id"]: e["seq"] for e in full}
+        assert len(trimmed) == 302
+        assert [e["seq"] for e in trimmed[1:]] == [seq_by_id[e["event_id"]] for e in trimmed[1:]]
+        seqs = [e["seq"] for e in full]
+        assert seqs == sorted(set(seqs))
+
+    async def test_seq_starts_above_the_entry_id_numbering_it_replaces(self, manager: BrokerManager) -> None:
+        """A client resuming with a seq from the ((ms << 8) + n) << 3 numbering must not skip new events."""
+        await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1}))])
+        entry = manager._log("t1").entries[0]
+        ms, _ = entry_key(entry.entry_id)
+
+        assert entry.seq > (((ms - 1) << 8) + 255 << 3) + 7
 
     async def test_seq_keeps_rising_after_earlier_runs_expire(self, manager: BrokerManager) -> None:
         """#751: a new connection must not number a new run below seqs the client already saw."""

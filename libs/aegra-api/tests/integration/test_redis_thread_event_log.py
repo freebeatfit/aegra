@@ -16,7 +16,7 @@ import redis.asyncio as aioredis
 
 from aegra_api.core.redis_manager import RedisManager
 from aegra_api.services import redis_broker as redis_broker_module
-from aegra_api.services.base_broker import READ_BATCH, SNAPSHOT_MARKER, entry_key
+from aegra_api.services.base_broker import READ_BATCH, SEQ_STRIDE, SNAPSHOT_MARKER, entry_key
 from aegra_api.services.redis_broker import RedisBrokerManager
 from aegra_api.settings import settings
 
@@ -63,12 +63,12 @@ async def test_runs_of_a_thread_share_one_hash_tagged_stream_in_write_order(
     assert key.endswith("thread:{t-1}:events")
     assert await redis_client.xlen(key) == 3
     assert 0 < await redis_client.ttl(key) <= settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
-    assert [(run_id, write_id, event) for _, run_id, write_id, event in entries] == [
+    assert [(entry.run_id, entry.write_id, entry.event) for entry in entries] == [
         ("run-1", "w1", ("values", {"a": 1})),
         ("run-2", "w2", ("messages", {"event": "message-start"})),
         ("run-1", "w3", ("end", {"status": "success"})),
     ]
-    keys = [entry_key(entry_id) for entry_id, *_ in entries]
+    keys = [entry_key(entry.entry_id) for entry in entries]
     assert keys == sorted(set(keys))
 
 
@@ -77,10 +77,10 @@ async def test_read_from_a_cursor_returns_later_entries_in_batches(manager: Redi
         await manager.append("t-1", "run-1", f"w{i}", ("messages", {"i": i}))
 
     first = await manager.read_thread("t-1", "0-0")
-    rest = await manager.read_thread("t-1", first[-1][0])
+    rest = await manager.read_thread("t-1", first[-1].entry_id)
 
     assert len(first) == READ_BATCH
-    assert [event[1]["i"] for *_, event in first + rest] == list(range(READ_BATCH + 50))
+    assert [entry.event[1]["i"] for entry in first + rest] == list(range(READ_BATCH + 50))
 
 
 async def test_blocked_read_returns_when_a_write_lands(
@@ -94,7 +94,7 @@ async def test_blocked_read_returns_when_a_write_lands(
     await manager.append("t-1", "run-1", "w1", ("values", {"a": 1}))
 
     entries = await asyncio.wait_for(reader, timeout=2.0)
-    assert [event for *_, event in entries] == [("values", {"a": 1})]
+    assert [entry.event for entry in entries] == [("values", {"a": 1})]
 
 
 async def test_idle_read_returns_nothing_after_its_block(manager: RedisBrokerManager) -> None:
@@ -131,6 +131,44 @@ async def test_a_snapshot_and_its_marker_land_together_and_the_root_marker_is_ne
     ids = await manager.read_snapshot_ids("t-1")
     assert entries[0][0] == ids["[]"]
     assert len(entries) == 301
-    assert await manager.read_snapshots("t-1", ["[]", '["absent"]']) == {"[]": (ids["[]"], record)}
     first = (await manager.read_thread("t-1", "0-0"))[0]
-    assert (first[0], first[3]) == (ids["[]"], (SNAPSHOT_MARKER, "[]"))
+    assert await manager.read_snapshots("t-1", ["[]", '["absent"]']) == {"[]": (ids["[]"], first.seq, record)}
+    assert (first.entry_id, first.event) == (ids["[]"], (SNAPSHOT_MARKER, "[]"))
+
+
+async def test_each_entry_stores_a_seq_that_rises_by_the_stride(manager: RedisBrokerManager) -> None:
+    await manager.append("t-1", "run-1", "w1", ("updates", {"a": 1}))
+    await manager.put_snapshot("t-1", "run-1", "w2", "[]", {"run_id": "run-1", "checkpoint": None, "values": {}})
+
+    entries = await manager.read_thread("t-1", "0-0")
+    [(marker_id, seq, _record)] = (await manager.read_snapshots("t-1", ["[]"])).values()
+
+    assert entries[1].seq - entries[0].seq >= SEQ_STRIDE
+    assert (marker_id, seq) == (entries[1].entry_id, entries[1].seq)
+    assert entries[1].seq < 2**53
+
+
+async def test_seq_never_goes_back_after_the_thread_keys_expire(
+    manager: RedisBrokerManager, redis_client: aioredis.Redis
+) -> None:
+    # Many writes in a burst move the counter ahead of the clock.
+    for i in range(2000):
+        await manager.append("t-1", "run-1", f"w{i}", ("messages", {"i": i}))
+    last = (await redis_client.xrevrange(manager.stream_key("t-1"), count=1))[0]
+    await redis_client.delete(manager.stream_key("t-1"))
+
+    await manager.append("t-1", "run-2", "w-next", ("messages", {"i": 0}))
+
+    [entry] = await manager.read_thread("t-1", "0-0")
+    assert entry.seq > int(last[1]["s"])
+
+
+async def test_a_snapshot_written_by_fb6_reads_with_the_seq_fb6_gave_it(
+    manager: RedisBrokerManager, redis_client: aioredis.Redis
+) -> None:
+    keys = manager._keys("t-1")
+    await redis_client.hset(keys.snapshot_ids, "[]", "5-2")
+    await redis_client.hset(keys.snapshots, "[]", '{"run_id": "run-1"}')
+
+    assert await manager.read_snapshot_ids("t-1") == {"[]": "5-2"}
+    assert await manager.read_snapshots("t-1", ["[]"]) == {"[]": ("5-2", ((5 << 8) + 2) << 3, {"run_id": "run-1"})}

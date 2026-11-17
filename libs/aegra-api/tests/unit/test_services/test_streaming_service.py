@@ -19,7 +19,7 @@ def manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[BrokerManager]:
 
 
 def _logged(manager: BrokerManager, thread_id: str = "t1") -> list[tuple[str, Any]]:
-    return [(run_id, event) for _entry_id, run_id, _write_id, event in manager._log(thread_id).entries]
+    return [(entry.run_id, entry.event) for entry in manager._log(thread_id).entries]
 
 
 @pytest.mark.asyncio
