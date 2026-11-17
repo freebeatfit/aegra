@@ -91,7 +91,7 @@ class TestAppend:
         client.register_script.assert_called_once_with(_WRITE_SCRIPT)
         client.register_script.return_value.assert_awaited_once_with(
             keys=_KEYS,
-            args=[window * 1000, window, "run-1", "w1", "", json.dumps(["updates", {"a": 1}]), _SEQ_TTL_SECONDS],
+            args=[window * 1000, window, "run-1", "w1", "", json.dumps(["updates", {"a": 1}]), _SEQ_TTL_SECONDS, "m"],
         )
 
     @pytest.mark.asyncio
@@ -107,7 +107,7 @@ class TestAppend:
 
         _, kwargs = client.register_script.return_value.call_args
         assert kwargs["keys"] == _KEYS
-        assert kwargs["args"][2:] == ["run-1", "w1", "[]", json.dumps({"values": {"a": 1}}), _SEQ_TTL_SECONDS]
+        assert kwargs["args"][2:] == ["run-1", "w1", "[]", json.dumps({"values": {"a": 1}}), _SEQ_TTL_SECONDS, "m"]
 
     @pytest.mark.asyncio
     async def test_retries_a_transient_failure_with_the_same_write_id(self) -> None:

@@ -35,6 +35,8 @@ logger = structlog.getLogger(__name__)
 READ_BATCH = 200
 
 SNAPSHOT_MARKER = "snapshot"
+# A marker whose snapshot carries interrupts, so a stream on the input channel alone knows to read it.
+INTERRUPT_MARKER = "snapshot-interrupt"
 ROOT_NAMESPACE = "[]"
 # Wire events one entry can project to. now_ms * 2048 stays above fb.6's seqs and below 2**53 (JS-safe) until 2109.
 SEQ_STRIDE = 2048
@@ -47,7 +49,7 @@ class ThreadEntry(NamedTuple):
     seq: int
     run_id: str
     write_id: str
-    # A marker's event is (SNAPSHOT_MARKER, namespace key): its snapshot lives in the thread's snapshots.
+    # A marker's event is (SNAPSHOT_MARKER or INTERRUPT_MARKER, namespace key); its snapshot is in the thread's snapshots.
     event: Any
 
 
@@ -92,6 +94,10 @@ def _params(event: Any) -> dict[str, Any]:
     payload = event[1] if isinstance(event, (tuple, list)) and len(event) == 2 else None
     params = payload.get("params") if isinstance(payload, dict) else None
     return params if isinstance(params, dict) else {}
+
+
+def _has_interrupts(event: Any) -> bool:
+    return bool(_params(event).get("interrupts"))
 
 
 def _namespace(event: Any) -> list[str]:
@@ -153,7 +159,12 @@ class RunBroker:
         }
         self._count(
             await self._manager.put_snapshot(
-                self.thread_id, run_id=self.run_id, write_id=uuid4().hex, namespace=namespace, record=record
+                self.thread_id,
+                run_id=self.run_id,
+                write_id=uuid4().hex,
+                namespace=namespace,
+                record=record,
+                interrupts=_has_interrupts(values),
             )
         )
 
@@ -214,7 +225,14 @@ class BaseBrokerManager(ABC):
 
     @abstractmethod
     async def put_snapshot(
-        self, thread_id: str, *, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+        self,
+        thread_id: str,
+        *,
+        run_id: str,
+        write_id: str,
+        namespace: str,
+        record: dict[str, Any],
+        interrupts: bool = False,
     ) -> bool:
         """Replace *namespace*'s snapshot with *record* and append its marker, in one atomic write.
 

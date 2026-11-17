@@ -657,11 +657,15 @@ async def test_reconnect_bytes_do_not_grow_with_the_number_of_steps(stream_serve
 
 
 @pytest.mark.asyncio
-async def test_interrupt_reaches_a_live_reader_and_a_client_that_reconnects(stream_server: _Server) -> None:
+# ["lifecycle", "input"] is the LangGraph SDK's interrupt watcher; it must see the interrupt without state channels.
+@pytest.mark.parametrize("channels", [["values", "input", "lifecycle"], ["lifecycle", "input"]])
+async def test_interrupt_reaches_a_live_reader_and_a_client_that_reconnects(
+    stream_server: _Server, channels: list[str]
+) -> None:
     thread_id = str(uuid4())
     async with httpx.AsyncClient(base_url=stream_server.base_url, timeout=None) as http:
-        live = await _run_to_end(stream_server, http, thread_id, "ask:" + "x" * 20000, ["values", "input", "lifecycle"])
-        fresh = await _reconnect(http, thread_id, ["values", "input", "lifecycle"])
+        live = await _run_to_end(stream_server, http, thread_id, "ask:" + "x" * 20000, channels)
+        fresh = await _reconnect(http, thread_id, channels)
 
     for stream in (live, fresh):
         requests = [e["params"]["data"] for e in stream.events if e["method"] == "input.requested"]

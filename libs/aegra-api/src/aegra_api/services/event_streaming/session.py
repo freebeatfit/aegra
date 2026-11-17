@@ -32,7 +32,14 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from aegra_api.services.base_broker import SNAPSHOT_MARKER, Snapshot, ThreadEntry, entry_before, entry_key
+from aegra_api.services.base_broker import (
+    INTERRUPT_MARKER,
+    SNAPSHOT_MARKER,
+    Snapshot,
+    ThreadEntry,
+    entry_before,
+    entry_key,
+)
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming.channels import is_supported_channel
 from aegra_api.services.event_streaming.normalizers import (
@@ -100,6 +107,8 @@ class ThreadEventSession:
         self._run_id = ""
         self._view = _RunView(graph=None)
         self._wants_state = bool({"values", "checkpoints"} & channels)
+        # Interrupts ride on snapshots, so an input-only stream reads the snapshots that carry them.
+        self._wants_interrupts = "input" in channels
         # Snapshots read but not yet emitted at their marker, by namespace key.
         self._pending: dict[str, Snapshot] = {}
 
@@ -133,7 +142,9 @@ class ThreadEventSession:
         wanted = [namespace for namespace in ids if self._wants_namespace(json.loads(namespace))]
         if not wanted:
             return "0-0"
-        if self._wants_state:
+        if self._wants_state or self._wants_interrupts:
+            # ponytail: an input-only stream also reads snapshots without interrupts here (once per connect);
+            # record the marker kind in snapshot-ids if that read shows up in Redis bandwidth.
             self._pending = await broker_manager.read_snapshots(self._thread_id, wanted)
         return entry_before(min((ids[namespace] for namespace in wanted), key=entry_key))
 
@@ -157,12 +168,12 @@ class ThreadEventSession:
 
     async def _read_snapshots(self, entries: list[ThreadEntry]) -> None:
         """Read the snapshot of each wanted namespace's last marker in *entries*, unless already read."""
-        if not self._wants_state:
-            return
         latest: dict[str, str] = {}
         for entry in entries:
             namespace = _marker_namespace(entry.event)
-            if namespace is not None and self._wants_namespace(json.loads(namespace)):
+            if namespace is None or not self._reads_marker(entry.event):
+                continue
+            if self._wants_namespace(json.loads(namespace)):
                 latest[namespace] = entry.entry_id
         stale = [
             namespace
@@ -171,6 +182,10 @@ class ThreadEventSession:
         ]
         if stale:
             self._pending.update(await broker_manager.read_snapshots(self._thread_id, stale))
+
+    def _reads_marker(self, raw_event: Any) -> bool:
+        method, _ = _unwrap(raw_event)
+        return self._wants_state or (self._wants_interrupts and method == INTERRUPT_MARKER)
 
     async def _lookup(self, run_id: str) -> VisibleRun | None:
         if run_id not in self._visible:
@@ -472,7 +487,7 @@ def _prefix_matches(namespace: list[str], prefix: tuple[str, ...]) -> bool:
 def _marker_namespace(raw_event: Any) -> str | None:
     """The namespace key of a snapshot marker entry, else None."""
     method, payload = _unwrap(raw_event)
-    return payload if method == SNAPSHOT_MARKER and isinstance(payload, str) else None
+    return payload if method in (SNAPSHOT_MARKER, INTERRUPT_MARKER) and isinstance(payload, str) else None
 
 
 def _is_terminal(raw_event: Any) -> bool:

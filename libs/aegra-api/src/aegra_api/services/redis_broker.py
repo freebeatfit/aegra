@@ -26,6 +26,7 @@ from aegra_api.core.redis_manager import redis_manager
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import (
+    INTERRUPT_MARKER,
     READ_BATCH,
     ROOT_NAMESPACE,
     SEQ_STRIDE,
@@ -68,7 +69,7 @@ local id
 if ARGV[5] == '' then
   id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 's', seq, 'r', ARGV[3], 'w', ARGV[4], 'e', ARGV[6])
 else
-  id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 's', seq, 'r', ARGV[3], 'w', ARGV[4], 'm', ARGV[5])
+  id = redis.call('XADD', KEYS[1], 'MINID', '~', minid, '*', 's', seq, 'r', ARGV[3], 'w', ARGV[4], ARGV[8], ARGV[5])
   redis.call('HSET', KEYS[2], ARGV[5], id .. ' ' .. seq)
   redis.call('HSET', KEYS[3], ARGV[5], ARGV[6])
 end
@@ -112,9 +113,11 @@ def _deserialize_payload(raw: Any) -> Any:
 
 
 def _entry_event(fields: dict[str, str]) -> Any:
-    """A stream entry's event: the stored one, or a snapshot marker's (SNAPSHOT_MARKER, namespace)."""
+    """A stream entry's event: the stored one, or a snapshot marker's (marker kind, namespace)."""
     if "m" in fields:
         return (SNAPSHOT_MARKER, fields["m"])
+    if "mi" in fields:
+        return (INTERRUPT_MARKER, fields["mi"])
     return _deserialize_payload(json.loads(fields["e"]))
 
 
@@ -173,16 +176,30 @@ class RedisBrokerManager(BaseBrokerManager):
         )
 
     async def put_snapshot(
-        self, thread_id: str, *, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+        self,
+        thread_id: str,
+        *,
+        run_id: str,
+        write_id: str,
+        namespace: str,
+        record: dict[str, Any],
+        interrupts: bool = False,
     ) -> bool:
         return await self._write(
-            thread_id, run_id=run_id, write_id=write_id, namespace=namespace, payload=_serialize_payload(record)
+            thread_id,
+            run_id=run_id,
+            write_id=write_id,
+            namespace=namespace,
+            payload=_serialize_payload(record),
+            marker_field="mi" if interrupts else "m",
         )
 
-    async def _write(self, thread_id: str, *, run_id: str, write_id: str, namespace: str, payload: str) -> bool:
+    async def _write(
+        self, thread_id: str, *, run_id: str, write_id: str, namespace: str, payload: str, marker_field: str = "m"
+    ) -> bool:
         window = settings.event_streaming.RESUMABLE_STREAM_TTL_SECONDS
         # namespace "" is a plain event; otherwise payload is that namespace's snapshot record.
-        args = [window * 1000, window, run_id, write_id, namespace, payload, _SEQ_TTL_SECONDS]
+        args = [window * 1000, window, run_id, write_id, namespace, payload, _SEQ_TTL_SECONDS, marker_field]
         attempt = 0
         while True:
             try:

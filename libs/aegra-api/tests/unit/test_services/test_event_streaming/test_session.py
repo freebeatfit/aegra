@@ -1054,6 +1054,32 @@ class TestLatestStateReplay:
         assert _shape(events)[1:] == [("checkpoints", [], {"id": "c1", "step": 1}), ("values", [], {"a": 1})]
         assert len(reads) == 1  # the newer snapshot, read once, waited for its own marker
 
+    async def test_an_input_only_stream_gets_the_interrupt_from_its_snapshot_once(
+        self, manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        interrupted = (
+            "values",
+            _protocol_event("values", {"a": 0}, interrupts=[{"id": "i1", "value": "q?"}], timestamp=1),
+        )
+        await _publish(manager, "run-1", [*_step(0, {"a": 0}), interrupted, ("end", {"status": "interrupted"})])
+        read_snapshots = manager.read_snapshots
+        reads: list[list[str]] = []
+
+        async def counted(thread_id: str, namespaces: list[str]) -> Any:
+            reads.append(namespaces)
+            return await read_snapshots(thread_id, namespaces)
+
+        monkeypatch.setattr(manager, "read_snapshots", counted)
+
+        events = await _collect(_make_session("t1", channels={"input", "lifecycle"}))
+
+        assert [(e["method"], e["params"]["data"].get("interrupt_id")) for e in events] == [
+            ("lifecycle", None),
+            ("input.requested", "i1"),
+            ("lifecycle", None),
+        ]
+        assert reads == [["[]"]]  # the plain step's marker reads nothing
+
     async def test_a_stream_without_state_channels_reads_no_snapshot(
         self, manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:

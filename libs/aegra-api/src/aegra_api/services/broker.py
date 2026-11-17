@@ -11,6 +11,7 @@ import structlog
 from aegra_api.core.active_runs import active_runs
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import (
+    INTERRUPT_MARKER,
     READ_BATCH,
     ROOT_NAMESPACE,
     SNAPSHOT_MARKER,
@@ -94,10 +95,17 @@ class BrokerManager(BaseBrokerManager):
         return True
 
     async def put_snapshot(
-        self, thread_id: str, *, run_id: str, write_id: str, namespace: str, record: dict[str, Any]
+        self,
+        thread_id: str,
+        *,
+        run_id: str,
+        write_id: str,
+        namespace: str,
+        record: dict[str, Any],
+        interrupts: bool = False,
     ) -> bool:
         log = self._log(thread_id)
-        marker = log.write(run_id, write_id, (SNAPSHOT_MARKER, namespace))
+        marker = log.write(run_id, write_id, (INTERRUPT_MARKER if interrupts else SNAPSHOT_MARKER, namespace))
         log.snapshots[namespace] = Snapshot(marker.entry_id, marker.seq, record)
         return True
 

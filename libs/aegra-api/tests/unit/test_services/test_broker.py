@@ -8,7 +8,7 @@ import pytest
 from prometheus_client import REGISTRY
 
 from aegra_api.services import broker as broker_module
-from aegra_api.services.base_broker import SNAPSHOT_MARKER, entry_key
+from aegra_api.services.base_broker import INTERRUPT_MARKER, SNAPSHOT_MARKER, entry_key
 from aegra_api.services.broker import BrokerManager
 from aegra_api.settings import settings
 
@@ -78,9 +78,10 @@ class TestRunBroker:
             await broker.put(event)
 
         entries = await manager.read_thread("t1", "0-0")
+        # The interrupt's marker says so, for streams that read only the input channel.
         assert [entry.event for entry in entries] == [
             (SNAPSHOT_MARKER, "[]"),
-            (SNAPSHOT_MARKER, "[]"),
+            (INTERRUPT_MARKER, "[]"),
             ("end", {"status": "interrupted"}),
         ]
         snapshots = await manager.read_snapshots("t1", ["[]"])
@@ -103,7 +104,7 @@ class TestRunBroker:
             await broker.put(event)
 
         entries = await manager.read_thread("t1", "0-0")
-        assert [entry.event for entry in entries] == [first, second, (SNAPSHOT_MARKER, "[]")]
+        assert [entry.event for entry in entries] == [first, second, (INTERRUPT_MARKER, "[]")]
         [snapshot] = (await manager.read_snapshots("t1", ["[]"])).values()
         assert snapshot.record["checkpoint"] is None
 
