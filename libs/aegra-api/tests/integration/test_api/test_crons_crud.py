@@ -345,7 +345,7 @@ class TestCreateCronExtended:
                 "enabled": False,
                 "multitask_strategy": "reject",
                 "stream_mode": "values",
-                "stream_subgraphs": True,
+                "stream_subgraphs": False,
             },
         )
         assert resp.status_code == 200

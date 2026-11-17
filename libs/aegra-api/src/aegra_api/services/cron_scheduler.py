@@ -59,8 +59,6 @@ def _build_run_create(cron: CronORM) -> RunCreate:
         checkpoint=payload.get("checkpoint"),
         interrupt_before=payload.get("interrupt_before"),
         interrupt_after=payload.get("interrupt_after"),
-        stream_subgraphs=payload.get("stream_subgraphs"),
-        stream_mode=payload.get("stream_mode"),
         multitask_strategy=payload.get("multitask_strategy"),
         durability=payload.get("durability"),
         checkpoint_during=payload.get("checkpoint_during"),

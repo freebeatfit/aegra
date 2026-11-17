@@ -4,6 +4,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from langgraph_sdk import get_client
 from pydantic import ValidationError
 
 from aegra_api.models.runs import RunCreate
@@ -158,3 +159,67 @@ class TestRunCreateMetadataValidation:
         """Boundary: exactly 512 chars is allowed."""
         run_create = RunCreate(**self._payload(metadata={"k": "v" * 512}))
         assert len(run_create.metadata["k"]) == 512
+
+
+async def _sdk_default_bodies() -> list[dict[str, Any]]:
+    """The bodies ``langgraph_sdk`` sends for ``runs.create`` and ``runs.wait`` with no options."""
+    client = get_client(url="http://sdk.invalid")
+    bodies: list[dict[str, Any]] = []
+
+    async def capture(*_args: Any, json: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        bodies.append(json)
+        return {}
+
+    client.runs.http.post = capture  # type: ignore[method-assign]
+    client.runs.http.request_reconnect = capture  # type: ignore[method-assign]
+    await client.runs.create("t1", "agent", input={"x": 1})
+    await client.runs.wait("t1", "agent", input={"x": 1})
+    return bodies
+
+
+class TestV1StreamOptions:
+    """Streaming is Agent Protocol v2 only: a v1 stream option is refused unless it is the SDK's no-op default."""
+
+    async def test_sdk_default_bodies_are_accepted(self) -> None:
+        bodies = await _sdk_default_bodies()
+
+        assert bodies[0]["stream_mode"] == "values"  # the SDK sends its stream defaults on every create
+        for body in bodies:
+            RunCreate.model_validate(body)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("stream", False),
+            ("stream_mode", None),
+            ("stream_mode", "values"),
+            ("stream_mode", ["values"]),
+            ("stream_subgraphs", None),
+            ("stream_subgraphs", False),
+            ("stream_resumable", False),
+            ("on_disconnect", None),
+            ("on_disconnect", "continue"),
+        ],
+    )
+    def test_no_op_values_are_accepted(self, field: str, value: Any) -> None:
+        RunCreate.model_validate({"assistant_id": "agent", "input": {"x": 1}, field: value})
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("stream", True),
+            ("stream_mode", "updates"),
+            ("stream_mode", ["values", "messages"]),
+            ("stream_subgraphs", True),
+            ("stream_resumable", True),
+            ("on_disconnect", "cancel"),
+        ],
+    )
+    def test_a_value_that_asks_for_a_v1_stream_is_refused(self, field: str, value: Any) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            RunCreate.model_validate({"assistant_id": "agent", "input": {"x": 1}, field: value})
+
+        error = exc_info.value.errors()[0]
+        assert error["loc"] == (field,)
+        assert field in error["msg"]
+        assert "Agent Protocol v2" in error["msg"]

@@ -487,7 +487,7 @@ class TestFireCron:
                 "input": {"data": True},
                 "config": {"k": "v"},
                 "interrupt_before": ["step1"],
-                "stream_mode": "values",
+                "stream_mode": "updates",  # stored before streaming was v2-only; never forwarded
                 "checkpoint": {"checkpoint_id": "abc", "checkpoint_ns": ""},
             },
             end_time=None,
@@ -507,7 +507,7 @@ class TestFireCron:
             assert run_request.input == {"data": True}
             assert run_request.config == {"k": "v"}
             assert run_request.interrupt_before == ["step1"]
-            assert run_request.stream_mode == "values"
+            assert run_request.stream_mode is None
             assert run_request.checkpoint == {"checkpoint_id": "abc", "checkpoint_ns": ""}
 
 

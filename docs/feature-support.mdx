@@ -45,6 +45,18 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Checkpoint durability | Supported | `durability` (`sync`, `async`, `exit`) per run or cron, deprecated `checkpoint_during` alias, server default via `checkpointer.durability` or `AEGRA_CHECKPOINT_DURABILITY`. |
 | Cron / scheduled jobs | Supported | Create, read, update, delete, search, and count scheduled jobs, including metadata filtering. Standard and seconds-level cron expressions. IANA timezone support. |
 
+### No-op request fields
+
+The LangGraph SDK sends these run and cron fields on every call. Every run streams on Agent Protocol v2, so they change nothing: Aegra accepts only the values below and answers any other value with `422`, naming the field.
+
+| Field | Accepted | Why it is a no-op |
+|:--|:--|:--|
+| `stream_mode` | omitted, `"values"`, `["values"]` | The SDK default. Channels are chosen per connection on `POST /threads/{thread_id}/stream/events`. |
+| `stream_subgraphs` | omitted, `false` | The SDK default. Subgraph events reach the thread stream; filter them with `namespaces` / `depth`. |
+| `stream_resumable` | omitted, `false` | The SDK default. Every thread stream is resumable. |
+| `on_disconnect` | omitted, `"continue"` | REST runs never stream, so a disconnect never cancels them. |
+| `stream` | omitted, `false` | Not sent by the SDK; kept so an old body still validates. |
+
 ### Scaling and reliability
 
 | Feature | Status | Notes |

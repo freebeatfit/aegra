@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -32,10 +33,30 @@ _METADATA_MAX_VALUE_LEN = 512
 Durability = Literal["sync", "async", "exit"]
 
 
-# Fields the retired v1 run-stream endpoints read; the SDK still sends them.
+# Options of the retired v1 run streams, each with the values that change nothing: the LangGraph SDK
+# sends its defaults on every call. Any other value is refused (docs/feature-support.mdx).
+_V1_STREAM_NO_OPS: dict[str, tuple[Any, ...]] = {
+    "stream": (False,),
+    "stream_mode": (None, "values", ["values"]),
+    "stream_subgraphs": (None, False),
+    "stream_resumable": (None, False),
+    "on_disconnect": (None, "continue"),
+}
 _V1_STREAM_FIELD = (
-    "Ignored: every run streams on the Agent Protocol v2 thread stream (POST /threads/{thread_id}/stream/events)."
+    "No-op: every run streams on Agent Protocol v2 (POST /threads/{thread_id}/stream/events). "
+    "Only the LangGraph SDK default is accepted; any other value returns 422."
 )
+
+
+def refuse_v1_stream_option(field: str, value: Any) -> Any:
+    """Return *value* if it is a no-op for *field*; raise when it asks for a v1 run stream."""
+    no_ops = _V1_STREAM_NO_OPS[field]
+    if value in no_ops:
+        return value
+    raise ValueError(
+        f"{field}={value!r} is not supported: runs stream only on Agent Protocol v2 "
+        f"(POST /threads/{{thread_id}}/stream/events). Accepted values: {', '.join(map(repr, no_ops))}."
+    )
 
 
 class RunCreate(BaseModel):
@@ -96,6 +117,7 @@ class RunCreate(BaseModel):
     )
 
     stream_subgraphs: bool | None = Field(False, description=_V1_STREAM_FIELD)
+    stream_resumable: bool | None = Field(False, description=_V1_STREAM_FIELD)
 
     # Request metadata (top-level in payload).  Reaches OTEL trace
     # attributes as ``langfuse.trace.metadata.<key>`` (and the
@@ -116,6 +138,11 @@ class RunCreate(BaseModel):
             "sub-agent type) rather than payload data."
         ),
     )
+
+    @field_validator(*_V1_STREAM_NO_OPS)
+    @classmethod
+    def refuse_v1_stream_options(cls, value: Any, info: ValidationInfo) -> Any:
+        return refuse_v1_stream_option(info.field_name or "", value)
 
     @field_validator("metadata", mode="after")
     @classmethod

@@ -50,8 +50,6 @@ def _build_payload(request: CronCreate | CronUpdate) -> dict[str, Any]:
         "interrupt_after",
         "webhook",
         "multitask_strategy",
-        "stream_mode",
-        "stream_subgraphs",
         "timezone",
         "durability",
         "checkpoint_during",

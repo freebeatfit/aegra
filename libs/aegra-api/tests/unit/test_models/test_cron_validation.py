@@ -149,3 +149,24 @@ class TestDurability:
     def test_update_rejects_unknown_mode(self) -> None:
         with pytest.raises(ValidationError, match="durability"):
             CronUpdate.model_validate({"durability": "eventually"})
+
+
+class TestV1StreamOptions:
+    """A cron's runs stream on Agent Protocol v2, so only the no-op stream options are accepted."""
+
+    @pytest.mark.parametrize(("field", "value"), [("stream_mode", "updates"), ("stream_subgraphs", True)])
+    def test_create_refuses_a_v1_stream_option(self, field: str, value: object) -> None:
+        with pytest.raises(ValidationError, match="Agent Protocol v2") as exc_info:
+            CronCreate.model_validate({"input": {"q": 1}, "assistant_id": "a", "schedule": "* * * * *", field: value})
+        assert exc_info.value.errors()[0]["loc"] == (field,)
+
+    @pytest.mark.parametrize(("field", "value"), [("stream_mode", ["messages"]), ("stream_subgraphs", True)])
+    def test_update_refuses_a_v1_stream_option(self, field: str, value: object) -> None:
+        with pytest.raises(ValidationError, match="Agent Protocol v2"):
+            CronUpdate.model_validate({field: value})
+
+    def test_no_op_stream_options_are_accepted(self) -> None:
+        req = CronCreate(
+            input={"q": 1}, assistant_id="a", schedule="* * * * *", stream_mode="values", stream_subgraphs=False
+        )
+        assert (req.stream_mode, req.stream_subgraphs) == ("values", False)

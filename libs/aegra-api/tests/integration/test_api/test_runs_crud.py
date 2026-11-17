@@ -697,8 +697,8 @@ class TestWaitForRun:
         # Should accept the parameter (may fail later in execution, but not validation)
         assert resp.status_code != 422
 
-    def test_wait_for_run_with_stream_subgraphs(self):
-        """Test wait endpoint accepts stream_subgraphs parameter"""
+    def test_wait_for_run_refuses_stream_subgraphs(self) -> None:
+        """Runs stream on Agent Protocol v2 only, so asking for subgraph events here is refused, not ignored."""
         app = create_test_app(include_runs=True, include_threads=False)
 
         override_session_dependency(app, BasicSession)
@@ -714,8 +714,8 @@ class TestWaitForRun:
                 },
             )
 
-        # Should accept the parameter
-        assert resp.status_code != 422
+        assert resp.status_code == 422
+        assert "Agent Protocol v2" in resp.text
 
     def test_wait_for_run_with_command(self):
         """Test wait endpoint with command instead of input"""
@@ -866,6 +866,46 @@ class TestCreateRunValidation:
         resp = client.post(
             "/threads/test-thread-123/runs",
             json={"assistant_id": "nonexistent", "checkpoint_id": "1ef4f797-8335-6428-8001-8a1503f9b875"},
+        )
+        # Past validation: the 404 comes from the assistant lookup.
+        assert resp.status_code == 404
+
+    @pytest.mark.parametrize(
+        ("field", "value"), [("stream_mode", "updates"), ("on_disconnect", "cancel"), ("stream_resumable", True)]
+    )
+    def test_create_run_refuses_a_v1_stream_option(self, field: str, value: Any) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs", json={"assistant_id": "asst-123", "input": {"x": 1}, field: value}
+        )
+
+        assert resp.status_code == 422
+        detail = resp.json()["detail"][0]
+        assert detail["loc"] == ["body", field]
+        assert "Agent Protocol v2" in detail["msg"]
+
+    def test_create_run_accepts_the_sdk_stream_defaults(self) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: Any) -> None:
+                return None
+
+        override_session_dependency(app, Session)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={
+                "assistant_id": "nonexistent",
+                "input": {"x": 1},
+                "stream_mode": "values",
+                "stream_subgraphs": False,
+                "stream_resumable": False,
+            },
         )
         # Past validation: the 404 comes from the assistant lookup.
         assert resp.status_code == 404

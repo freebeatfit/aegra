@@ -556,7 +556,7 @@ class TestBuildPayloadExtended:
             webhook="https://example.com/hook",
             multitask_strategy="reject",
             stream_mode="values",
-            stream_subgraphs=True,
+            stream_subgraphs=False,
         )
         payload = _build_payload(req)
         assert payload["input"] == {"x": 1}
@@ -566,8 +566,8 @@ class TestBuildPayloadExtended:
         assert payload["interrupt_after"] == "*"
         assert payload["webhook"] == "https://example.com/hook"
         assert payload["multitask_strategy"] == "reject"
-        assert payload["stream_mode"] == "values"
-        assert payload["stream_subgraphs"] is True
+        # No-op v1 stream options: every fired run streams on Agent Protocol v2.
+        assert "stream_mode" not in payload and "stream_subgraphs" not in payload
 
     def test_works_with_cron_update(self) -> None:
         req = CronUpdate(

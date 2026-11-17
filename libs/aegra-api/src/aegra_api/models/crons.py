@@ -4,16 +4,15 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from aegra_api.models.runs import Durability
+from aegra_api.models.runs import Durability, refuse_v1_stream_option
 from aegra_api.settings import settings
 
 # Field length caps. Keep these conservative; cron metadata is small by nature.
 _SCHEDULE_MAX_LEN = 256
 _TIMEZONE_MAX_LEN = 64
 _WEBHOOK_MAX_LEN = 2048
-_STREAM_MODE_MAX_LEN = 64
 _STR_FIELD_MAX_LEN = 256
 
 OnRunCompleted = Literal["delete", "keep"]
@@ -66,14 +65,16 @@ class CronCreate(BaseModel):
     timezone: str | None = Field(None, max_length=_TIMEZONE_MAX_LEN)
     durability: Durability | None = None
     checkpoint_during: bool | None = None
-    # NOTE: stream_resumable is NOT exposed here because RunCreate has no matching
-    # field yet. Accepting it silently drops the value at firing time.
+    stream_resumable: bool | None = None
+
+    @field_validator("stream_mode", "stream_subgraphs", "stream_resumable")
+    @classmethod
+    def _refuse_v1_stream_options(cls, value: Any, info: ValidationInfo) -> Any:
+        return refuse_v1_stream_option(info.field_name or "", value)
 
     @model_validator(mode="after")
     def _check(self) -> "CronCreate":
         self.webhook = _validate_webhook_url(self.webhook)
-        if isinstance(self.stream_mode, str) and len(self.stream_mode) > _STREAM_MODE_MAX_LEN:
-            raise ValueError("stream_mode is too long")
         if self.end_time is not None:
             now = datetime.now(UTC)
             end = self.end_time if self.end_time.tzinfo else self.end_time.replace(tzinfo=UTC)
@@ -122,13 +123,16 @@ class CronUpdate(BaseModel):
     stream_subgraphs: bool | None = None
     timezone: str | None = Field(None, max_length=_TIMEZONE_MAX_LEN)
     durability: Durability | None = None
-    # See CronCreate: stream_resumable omitted until RunCreate gains a matching field.
+    stream_resumable: bool | None = None
+
+    @field_validator("stream_mode", "stream_subgraphs", "stream_resumable")
+    @classmethod
+    def _refuse_v1_stream_options(cls, value: Any, info: ValidationInfo) -> Any:
+        return refuse_v1_stream_option(info.field_name or "", value)
 
     @model_validator(mode="after")
     def _check(self) -> "CronUpdate":
         self.webhook = _validate_webhook_url(self.webhook)
-        if isinstance(self.stream_mode, str) and len(self.stream_mode) > _STREAM_MODE_MAX_LEN:
-            raise ValueError("stream_mode is too long")
         if self.end_time is not None:
             now = datetime.now(UTC)
             end = self.end_time if self.end_time.tzinfo else self.end_time.replace(tzinfo=UTC)
