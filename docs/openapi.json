@@ -3,7 +3,7 @@
   "info": {
     "title": "Aegra",
     "description": "Production-ready Agent Protocol server",
-    "version": "0.11.0+fb.6"
+    "version": "0.11.0+fb.7"
   },
   "paths": {
     "/info": {
