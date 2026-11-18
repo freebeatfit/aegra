@@ -11,6 +11,7 @@ import pytest
 from aegra_api.services import broker as broker_module
 from aegra_api.services.base_broker import ThreadEntry, entry_key
 from aegra_api.services.broker import BrokerManager
+from aegra_api.services.event_streaming import protocol as protocol_module
 from aegra_api.services.event_streaming import session as session_module
 from aegra_api.services.event_streaming.session import (
     RunLookup,
@@ -291,6 +292,20 @@ class TestSeqAndFilter:
         second = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
 
         assert [(e["seq"], e["event_id"]) for e in first] == [(e["seq"], e["event_id"]) for e in second]
+
+    async def test_every_event_is_identical_on_every_connection(
+        self, manager: BrokerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Root lifecycle events have no producer timestamp; theirs is the log entry's, not the read's."""
+        await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
+        first = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+        monkeypatch.setattr(protocol_module.time, "time_ns", lambda: 9_999_999_999_000_000_000)
+
+        second = await _collect(_make_session("t1", channels={"values", "lifecycle"}))
+
+        assert second == first
+        entry_ms = entry_key(manager._log("t1").entries[0].entry_id)[0]
+        assert first[0]["params"]["timestamp"] == entry_ms
 
     async def test_seq_survives_a_trimmed_log(self, manager: BrokerManager) -> None:
         """A retained entry keeps the seq and event id it had before older entries were trimmed."""

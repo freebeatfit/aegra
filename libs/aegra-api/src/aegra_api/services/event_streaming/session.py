@@ -105,6 +105,7 @@ class ThreadEventSession:
         # run_id -> its view, or None once it ended or when the caller can't see it.
         self._runs: dict[str, _RunView | None] = {}
         self._run_id = ""
+        self._entry_ms: int | None = None
         self._view = _RunView(graph=None)
         self._wants_state = bool({"values", "checkpoints"} & channels)
         # Interrupts ride on snapshots, so an input-only stream reads the snapshots that carry them.
@@ -163,6 +164,7 @@ class ThreadEventSession:
                 continue
             # Past the running seed's slot, as at the marker.
             self._seq = max(self._seq, seq) + 1
+            self._entry_ms = entry_key(entry_id)[0]
             envelopes += self._snapshot(entry_id, record)
         return envelopes
 
@@ -209,9 +211,15 @@ class ThreadEventSession:
         # max() keeps seq rising should an entry ever project to more than SEQ_STRIDE events.
         self._seq = max(self._seq, seq)
 
+        # Events the producer didn't stamp (root lifecycle) take the entry's write time, the same on every read.
+        self._entry_ms = entry_key(entry_id)[0]
         envelopes: list[dict[str, Any]] = []
         if first:
-            envelopes = self._emit([("lifecycle", self._root_lifecycle("running"), [])], f"synth:{run_id}:running")
+            envelopes = self._emit(
+                [("lifecycle", self._root_lifecycle("running"), [])],
+                f"synth:{run_id}:running",
+                timestamp=self._entry_ms,
+            )
         else:
             # The running seed's slot, so an entry's seqs don't depend on where the replay started.
             self._seq += 1
@@ -247,6 +255,8 @@ class ThreadEventSession:
             event_id = f"synth:{self._run_id}:{method}"
         params = payload.get("params") if isinstance(payload, dict) else None
         timestamp = params.get("timestamp") if isinstance(params, dict) else None
+        if timestamp is None:
+            timestamp = self._entry_ms
         return self._emit(self._channel_events(method, payload), event_id, timestamp=timestamp, first_index=first_index)
 
     def _emit(
