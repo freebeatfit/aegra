@@ -171,6 +171,23 @@ class TestContentBlockCoverage:
         ]
 
 
+class TestHumanAdditionalKwargs:
+    def test_human_message_keeps_additional_kwargs(self) -> None:
+        marker = {"lc_source": "pinned_skill", "skill": {"name": "s", "path": "/skills/s/SKILL.md"}}
+        msg = {"type": "human", "content": "<skill>", "id": "m1", "additional_kwargs": marker}
+        out = normalize_state_payload({"messages": [msg]})
+        assert out["messages"][0]["additional_kwargs"] == marker
+
+    def test_empty_additional_kwargs_is_omitted(self) -> None:
+        out = normalize_state_payload({"messages": [{"type": "human", "content": "hi", "additional_kwargs": {}}]})
+        assert "additional_kwargs" not in out["messages"][0]
+
+    def test_ai_message_still_drops_additional_kwargs(self) -> None:
+        msg = {"type": "ai", "content": "x", "additional_kwargs": {"__gemini_function_call_thought_signatures__": "b"}}
+        out = normalize_state_payload({"messages": [msg]})
+        assert "additional_kwargs" not in out["messages"][0]
+
+
 class TestToolCallShapes:
     def test_openai_nested_function_shape_extracted(self) -> None:
         msg = {

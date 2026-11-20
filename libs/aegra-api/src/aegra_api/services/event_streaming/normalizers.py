@@ -151,6 +151,13 @@ def _normalize_message(value: dict[str, Any]) -> dict[str, Any]:
         message["name"] = value["name"]
     if msg_type in ("ai", "human") and isinstance(value.get("example"), bool):
         message["example"] = value["example"]
+    # FB: a human message's additional_kwargs is server-authored metadata a
+    # client needs, such as DeepAgents' pinned-skill marker (lc_source); the
+    # LangGraph SDK message type carries it, and the Agent Server keeps it.
+    # ai messages keep dropping it: there it holds provider replay data
+    # (thought signatures, raw function calls) the client never reads.
+    if msg_type == "human" and additional_kwargs:
+        message["additional_kwargs"] = additional_kwargs
 
     if msg_type == "tool":
         if isinstance(value.get("tool_call_id"), str):
